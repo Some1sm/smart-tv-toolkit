@@ -7,6 +7,7 @@ use iced::widget::{button, column, container, progress_bar, row, scrollable, spa
 use iced::{Alignment, Element, Fill, Font};
 
 use crate::Message;
+use crate::android::catalog::{self, AppSpec, SHIZUKU};
 use crate::android::health::{Finding, Fix, Severity};
 use crate::android::packages::{self, Action, ListKind, Package};
 use crate::android::sysinfo::Section;
@@ -337,4 +338,112 @@ pub fn packages(v: PackagesView<'_>) -> Element<'_, Message> {
     .spacing(4);
 
     column![top, list, selection, actions].spacing(8).padding(4).into()
+}
+
+// ── Install ──────────────────────────────────────────────────────────────────
+
+pub struct InstallView<'a> {
+    pub abis: &'a [String],
+    /// Names of apps (catalog names, or "Shizuku") currently downloading.
+    pub downloading: &'a BTreeSet<&'static str>,
+    pub busy: bool,
+}
+
+fn card<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
+    container(column![section_title(title), body].spacing(10))
+        .padding(16)
+        .width(Fill)
+        .style(theme::panel)
+        .into()
+}
+
+fn small_button(label: &str, style: fn(&iced::Theme, button::Status) -> button::Style, msg: Option<Message>) -> Element<'_, Message> {
+    button(text(label).size(12)).padding([5, 12]).style(style).on_press_maybe(msg).into()
+}
+
+fn app_cell<'a>(spec: &'static AppSpec, v: &InstallView<'a>) -> Element<'a, Message> {
+    let downloading = v.downloading.contains(spec.name);
+    let build = catalog::build_for(spec, v.abis);
+    let downloaded = catalog::download_path(spec, v.abis).is_some_and(|p| p.is_file());
+    let status = match (&build, downloaded) {
+        (Err(e), _) if !v.abis.is_empty() => e.clone(),
+        (Err(_), _) => "Connect to pick the build for your TV's CPU.".into(),
+        (Ok((_, _, note)), true) => format!("Downloaded{}", note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()),
+        (Ok(_), false) => String::new(),
+    };
+    let download_label = if downloading { "Downloading…" } else if downloaded { "Update" } else { "Download" };
+    let buttons = row![
+        small_button(download_label, theme::secondary_button,
+                     (!downloading && build.is_ok()).then_some(Message::QuickDownload(spec.name))),
+        small_button("Install", theme::primary_button,
+                     (downloaded && !downloading && !v.busy).then_some(Message::QuickInstall(spec.name))),
+        text(status).size(11).color(theme::TEXT_DISABLED),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    container(
+        column![
+            button(text(spec.name).size(13).color(theme::PRIMARY))
+                .padding(0)
+                .style(|_, _| button::Style::default())
+                .on_press(Message::OpenUrl(spec.homepage)),
+            text(spec.description).size(11).color(theme::TEXT_MUTED),
+            buttons,
+        ]
+        .spacing(6),
+    )
+    .padding(12)
+    .width(Fill)
+    .style(theme::card)
+    .into()
+}
+
+pub fn install(v: InstallView<'_>) -> Element<'_, Message> {
+    let apk = card(
+        "Install APK",
+        column![
+            text("Pick APK files, or a folder of them. Play Protect's install checks are paused during the install and put back as they were afterwards.")
+                .size(12)
+                .color(theme::TEXT_MUTED),
+            row![
+                small_button("Install APK files…", theme::primary_button, (!v.busy).then_some(Message::PickApks)),
+                small_button("Install folder…", theme::secondary_button, (!v.busy).then_some(Message::PickApkFolder)),
+                text(if v.busy { "Installing…" } else { "" }).size(12).color(theme::WARNING),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
+    let cells: Vec<Element<'_, Message>> = catalog::APPS.iter().map(|spec| app_cell(spec, &v)).collect();
+    let mut grid = column![].spacing(8);
+    let mut cells = cells.into_iter();
+    while let Some(left) = cells.next() {
+        let right = cells.next().unwrap_or_else(|| space().width(Fill).into());
+        grid = grid.push(row![left, right].spacing(8));
+    }
+    let quick = card("Quick Install Popular Apps", grid.into());
+
+    let shizuku_downloading = v.downloading.contains(SHIZUKU.name);
+    let shizuku_ready = catalog::download_path(&SHIZUKU, &[]).is_some_and(|p| p.is_file());
+    let shizuku = card(
+        "Shizuku",
+        column![
+            text(SHIZUKU.description).size(12).color(theme::TEXT_MUTED),
+            row![
+                small_button(if shizuku_downloading { "Downloading…" } else if shizuku_ready { "Update Shizuku" } else { "Download Shizuku" },
+                             theme::secondary_button, (!shizuku_downloading).then_some(Message::QuickDownload(SHIZUKU.name))),
+                small_button("Install & Start", theme::primary_button,
+                             (shizuku_ready && !v.busy).then_some(Message::ShizukuInstall)),
+                small_button("Start Shizuku", theme::secondary_button, (!v.busy).then_some(Message::ShizukuStart)),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
+    scrollable(column![apk, quick, shizuku].spacing(8).padding(4)).into()
 }

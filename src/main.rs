@@ -21,6 +21,7 @@ use iced::{Alignment, Element, Fill, Font, Length, Task, Theme};
 
 use android::health::{self, Finding, Fix};
 use android::packages::{self, Action, ListKind, Package};
+use android::{catalog, install, shizuku};
 use android::sysinfo::{self, Section};
 use android::{ConnectResult, Connection};
 use devices::Reach;
@@ -110,6 +111,10 @@ struct App {
     pkg_selected: BTreeSet<String>,
     pkg_loading: bool,
     pkg_busy: bool,
+    /// CPU types of the connected TV, preferred first.
+    abis: Vec<String>,
+    downloading: BTreeSet<&'static str>,
+    install_busy: bool,
     tab: Tab,
     log: Vec<String>,
 }
@@ -157,6 +162,17 @@ enum Message {
     PackageActionDone(Vec<String>),
     SaveApk,
     SaveApkTo(Vec<String>, Option<PathBuf>),
+    PickApks,
+    PickApkFolder,
+    InstallApks(Vec<PathBuf>),
+    InstallDone(Vec<String>),
+    QuickDownload(&'static str),
+    QuickDownloaded(&'static str, Result<String, String>),
+    QuickInstall(&'static str),
+    ShizukuInstall,
+    ShizukuStart,
+    InstallResult(Result<String, String>),
+    OpenUrl(&'static str),
 }
 
 impl App {
@@ -188,6 +204,9 @@ impl App {
             pkg_selected: BTreeSet::new(),
             pkg_loading: false,
             pkg_busy: false,
+            abis: Vec::new(),
+            downloading: BTreeSet::new(),
+            install_busy: false,
             tab: Tab::Info,
             log: Vec::new(),
         };
@@ -409,6 +428,7 @@ impl App {
                             }
                         }
                         self.sdk = summary.sdk.parse().unwrap_or(0);
+                        self.abis = summary.abis.clone();
                         self.connection = Some(connection);
                         self.device = Some(Device { platform: Platform::AndroidTv, address: serial, label });
                         return self.load_info();
@@ -581,6 +601,93 @@ impl App {
                     Message::PackageActionDone(lines)
                 });
             }
+            Message::PickApks => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Install APK files")
+                            .add_filter("Android app", &["apk"])
+                            .pick_files()
+                            .await
+                            .map(|files| files.iter().map(|f| f.path().to_path_buf()).collect())
+                            .unwrap_or_default()
+                    },
+                    Message::InstallApks,
+                );
+            }
+            Message::PickApkFolder => {
+                return Task::perform(
+                    async {
+                        let dir = rfd::AsyncFileDialog::new().set_title("Folder with APK files").pick_folder().await;
+                        dir.map(|d| install::apks_in(d.path())).unwrap_or_default()
+                    },
+                    Message::InstallApks,
+                );
+            }
+            Message::InstallApks(apks) => {
+                if apks.is_empty() {
+                    return Task::none();
+                }
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.log(format!("Installing {} APK(s)…", apks.len()));
+                self.install_busy = true;
+                return Task::perform(install::install_many(conn, apks), Message::InstallDone);
+            }
+            Message::InstallDone(lines) => {
+                self.install_busy = false;
+                for line in lines {
+                    self.log(line);
+                }
+            }
+            Message::QuickDownload(name) => {
+                let Some(spec) = catalog::APPS.iter().chain([&catalog::SHIZUKU]).find(|a| a.name == name).copied() else {
+                    return Task::none();
+                };
+                self.log(format!("Downloading {name}…"));
+                self.downloading.insert(name);
+                return Task::perform(catalog::fetch(spec, self.abis.clone()), move |r| Message::QuickDownloaded(name, r));
+            }
+            Message::QuickDownloaded(name, result) => {
+                self.downloading.remove(name);
+                match result {
+                    Ok(line) => self.log(line),
+                    Err(e) => self.log(format!("Download failed for {name}: {e}")),
+                }
+            }
+            Message::QuickInstall(name) => {
+                let Some(spec) = catalog::APPS.iter().find(|a| a.name == name) else { return Task::none() };
+                let (Some(conn), Some(apk)) = (self.connection.clone(), catalog::download_path(spec, &self.abis)) else {
+                    return Task::none();
+                };
+                self.log(format!("Installing {name}…"));
+                self.install_busy = true;
+                return Task::perform(install::install_with(conn, apk, spec.post_install), move |r| {
+                    Message::InstallResult(r.map(|out| format!("{name}: {out}")).map_err(|e| format!("{name}: {e}")))
+                });
+            }
+            Message::ShizukuInstall | Message::ShizukuStart => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.install_busy = true;
+                return if matches!(message, Message::ShizukuInstall) {
+                    self.log("Installing and starting Shizuku…");
+                    Task::perform(shizuku::install_and_start(conn), Message::InstallResult)
+                } else {
+                    self.log("Starting Shizuku…");
+                    Task::perform(shizuku::start(conn), Message::InstallResult)
+                };
+            }
+            Message::InstallResult(result) => {
+                self.install_busy = false;
+                match result {
+                    Ok(line) => self.log(line),
+                    Err(e) => self.log(format!("Install failed: {e}")),
+                }
+            }
+            Message::OpenUrl(url) => {
+                if let Err(e) = open::that(url) {
+                    self.log(format!("Could not open the browser: {e}"));
+                }
+            }
         }
         Task::none()
     }
@@ -737,6 +844,11 @@ impl App {
                 };
                 views::performance(state, self.fixing)
             }
+            Tab::Install => views::install(views::InstallView {
+                abis: &self.abis,
+                downloading: &self.downloading,
+                busy: self.install_busy,
+            }),
             Tab::Packages => views::packages(views::PackagesView {
                 kind: self.pkg_kind,
                 packages: &self.packages,

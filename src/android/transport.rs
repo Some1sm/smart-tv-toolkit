@@ -85,6 +85,21 @@ impl Connection {
         }
     }
 
+    /// Copy a local file to `remote` on the TV.
+    pub async fn push(&self, local: PathBuf, remote: String, timeout: Duration) -> Result<(), Error> {
+        let device = self.device.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&local).map_err(|e| Error::Adb(e.to_string()))?;
+            let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
+            device.push(&mut file, &remote).map_err(adb_error)
+        });
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(Error::Adb(join.to_string())),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
+
     /// Copy a file from the TV to `local`. A partial file is removed on failure.
     pub async fn pull(&self, remote: String, local: PathBuf, timeout: Duration) -> Result<u64, Error> {
         let device = self.device.clone();

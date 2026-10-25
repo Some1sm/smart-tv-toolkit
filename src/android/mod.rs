@@ -1,7 +1,10 @@
 //! Android TV / Google TV support, over ADB.
 
+pub mod catalog;
 pub mod health;
+pub mod install;
 pub mod packages;
+pub mod shizuku;
 pub mod sysinfo;
 pub mod transport;
 
@@ -29,6 +32,9 @@ pub struct DeviceSummary {
     pub android_version: String,
     pub sdk: String,
     pub abi: String,
+    /// Every ABI the TV runs, preferred first (picks quick-install builds;
+    /// e.g. a Chromecast with Google TV is armeabi-v7a, not arm64).
+    pub abis: Vec<String>,
 }
 
 impl DeviceSummary {
@@ -69,6 +75,7 @@ fn summary_from_props(props: &[(String, String)]) -> DeviceSummary {
         android_version: get("ro.build.version.release"),
         sdk: get("ro.build.version.sdk"),
         abi: get("ro.product.cpu.abi"),
+        abis: get("ro.product.cpu.abilist").split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect(),
     }
 }
 

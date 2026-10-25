@@ -34,24 +34,37 @@ pub fn parse_prefix(prefix: &str) -> Option<[u8; 3]> {
     Some(out)
 }
 
-/// Try `port` on every host of a /24 at once; return the ones that accept.
-pub async fn scan(prefix: [u8; 3], port: u16, timeout: Duration) -> Vec<Ipv4Addr> {
-    let probes = (1..=254u8).map(|host| {
-        let ip = Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host);
-        tokio::spawn(async move {
-            let open = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((ip, port)))
-                .await
-                .is_ok_and(|r| r.is_ok());
-            open.then_some(ip)
+/// Try every (ip, port) at once; report which accepted a TCP connection.
+pub async fn probe(targets: Vec<(Ipv4Addr, u16)>, timeout: Duration) -> Vec<(Ipv4Addr, bool)> {
+    let tasks: Vec<_> = targets
+        .into_iter()
+        .map(|(ip, port)| {
+            tokio::spawn(async move {
+                let open = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((ip, port)))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                (ip, open)
+            })
         })
-    });
-    let mut found = Vec::new();
-    for probe in probes.collect::<Vec<_>>() {
-        if let Ok(Some(ip)) = probe.await {
-            found.push(ip);
+        .collect();
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if let Ok(result) = task.await {
+            results.push(result);
         }
     }
-    found
+    results
+}
+
+/// Every host address of a /24.
+pub fn hosts(prefix: [u8; 3]) -> impl Iterator<Item = Ipv4Addr> {
+    (1..=254u8).map(move |host| Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host))
+}
+
+/// Try `port` on every host of a /24 at once; return the ones that accept.
+pub async fn scan(prefix: [u8; 3], port: u16, timeout: Duration) -> Vec<Ipv4Addr> {
+    let targets = hosts(prefix).map(|ip| (ip, port)).collect();
+    probe(targets, timeout).await.into_iter().filter_map(|(ip, open)| open.then_some(ip)).collect()
 }
 
 #[cfg(test)]

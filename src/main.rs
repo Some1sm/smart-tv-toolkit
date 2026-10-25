@@ -2,21 +2,32 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod android;
+mod config;
+mod devices;
+mod history;
+mod mdns;
 mod net;
 mod platform;
 mod theme;
 
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use iced::widget::{button, column, container, row, rule, scrollable, space, text, text_input};
-use iced::{Element, Fill, Font, Length, Task, Theme};
+use iced::{Alignment, Element, Fill, Font, Length, Task, Theme};
 
 use android::{ConnectResult, Connection, DeviceSummary};
+use devices::Reach;
+use history::History;
+use mdns::MdnsDevice;
 use platform::{Device, Platform};
 
 /// How long each host gets to answer during a network scan.
 const SCAN_TIMEOUT: Duration = Duration::from_millis(600);
+/// How long to listen for mDNS announcements.
+const MDNS_LISTEN: Duration = Duration::from_secs(3);
 
 pub fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
@@ -68,16 +79,15 @@ impl Tab {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ScanState {
-    Idle,
-    Scanning,
-    Done(Vec<Ipv4Addr>),
-}
-
 struct App {
+    history: History,
+    /// IPs where ADB answered, and every IP whose ADB port has been checked.
+    open: BTreeSet<Ipv4Addr>,
+    checked: BTreeSet<Ipv4Addr>,
+    mdns: Vec<MdnsDevice>,
     subnet: String,
-    scan: ScanState,
+    scanning: bool,
+    listening: bool,
     ip: String,
     port: String,
     connecting: bool,
@@ -93,8 +103,13 @@ struct App {
 enum Message {
     SubnetChanged(String),
     Scan,
-    ScanFinished(Vec<Ipv4Addr>),
-    PickFound(Ipv4Addr),
+    ScanFinished([u8; 3], Vec<Ipv4Addr>),
+    Probed(Vec<(Ipv4Addr, bool)>),
+    MdnsFinished(Result<Vec<MdnsDevice>, String>),
+    Pick(Ipv4Addr, u16),
+    Forget(Ipv4Addr),
+    Import,
+    ImportPicked(Option<PathBuf>),
     IpChanged(String),
     PortChanged(String),
     Connect,
@@ -104,11 +119,17 @@ enum Message {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new() -> (Self, Task<Message>) {
         let subnet = net::local_ipv4().map(net::subnet_prefix).unwrap_or_else(|| "192.168.1".into());
-        App {
+        let history = history::load();
+        let mut app = App {
+            history,
+            open: BTreeSet::new(),
+            checked: BTreeSet::new(),
+            mdns: Vec::new(),
             subnet,
-            scan: ScanState::Idle,
+            scanning: false,
+            listening: false,
             ip: String::new(),
             port: android::ADB_PORT.to_string(),
             connecting: false,
@@ -117,8 +138,15 @@ impl App {
             device: None,
             summary: None,
             tab: Tab::Info,
-            log: vec!["Ready. Scan your network or enter the TV's IP address.".into()],
-        }
+            log: Vec::new(),
+        };
+        app.log(match app.history.len() {
+            0 => "Ready. Scan your network or enter the TV's IP address.".to_owned(),
+            n => format!("Ready. Checking {n} saved device(s)…"),
+        });
+        // On launch: see which saved devices are up, and listen for TVs.
+        let task = Task::batch([app.probe_saved(), app.listen()]);
+        (app, task)
     }
 
     fn title(&self) -> String {
@@ -134,6 +162,29 @@ impl App {
 
     fn log(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
+    }
+
+    fn probe_saved(&self) -> Task<Message> {
+        let targets: Vec<(Ipv4Addr, u16)> = self
+            .history
+            .iter()
+            .filter_map(|(ip, d)| Some((ip.parse().ok()?, d.port)))
+            .collect();
+        if targets.is_empty() {
+            return Task::none();
+        }
+        Task::perform(net::probe(targets, Duration::from_secs(1)), Message::Probed)
+    }
+
+    fn listen(&mut self) -> Task<Message> {
+        self.listening = true;
+        Task::perform(mdns::discover(MDNS_LISTEN), Message::MdnsFinished)
+    }
+
+    fn save_history(&mut self) {
+        if let Err(e) = history::save(&self.history) {
+            self.log(format!("Could not save device history: {e}"));
+        }
     }
 
     fn start_connect(&mut self) -> Task<Message> {
@@ -168,25 +219,100 @@ impl App {
                     return Task::none();
                 };
                 let [a, b, c] = prefix;
-                self.log(format!("Scanning {a}.{b}.{c}.1–254 for TVs (port {})…", android::ADB_PORT));
-                self.scan = ScanState::Scanning;
-                return Task::perform(
-                    net::scan(prefix, android::ADB_PORT, SCAN_TIMEOUT),
-                    Message::ScanFinished,
-                );
-            }
-            Message::ScanFinished(found) => {
-                self.log(match found.len() {
-                    0 => "No TVs found. Check that network debugging is on, or enter the IP.".to_owned(),
-                    n => format!("Found {n} device(s) with ADB open."),
+                self.log(format!("Scanning {a}.{b}.{c}.1–254 and listening for TVs…"));
+                self.scanning = true;
+                let scan = Task::perform(net::scan(prefix, android::ADB_PORT, SCAN_TIMEOUT), move |found| {
+                    Message::ScanFinished(prefix, found)
                 });
-                self.scan = ScanState::Done(found);
+                return Task::batch([scan, self.listen()]);
             }
-            Message::PickFound(ip) => {
+            Message::ScanFinished(prefix, found) => {
+                self.scanning = false;
+                for ip in net::hosts(prefix) {
+                    self.checked.insert(ip);
+                    self.open.remove(&ip);
+                }
+                self.log(match found.len() {
+                    0 => "Scan: no devices with ADB open.".to_owned(),
+                    n => format!("Scan: {n} device(s) with ADB open."),
+                });
+                self.open.extend(found);
+            }
+            Message::Probed(results) => {
+                let up = results.iter().filter(|(_, open)| *open).count();
+                let total = results.len();
+                for (ip, open) in results {
+                    self.checked.insert(ip);
+                    if open {
+                        self.open.insert(ip);
+                    } else {
+                        self.open.remove(&ip);
+                    }
+                }
+                self.log(format!("Checked {total} device(s): {up} with ADB open."));
+            }
+            Message::MdnsFinished(result) => {
+                self.listening = false;
+                match result {
+                    Ok(found) => {
+                        let tvs: Vec<String> = found
+                            .iter()
+                            .filter(|d| d.is_tv())
+                            .filter_map(|d| d.name.clone().or_else(|| d.ip.map(|ip| ip.to_string())))
+                            .collect();
+                        if !tvs.is_empty() {
+                            self.log(format!("Announced on the network: {}", tvs.join(", ")));
+                        }
+                        // Check ADB on announced TVs not checked yet, so the
+                        // list can say "debugging off" instead of nothing.
+                        let unchecked: Vec<(Ipv4Addr, u16)> = found
+                            .iter()
+                            .filter(|d| d.is_tv())
+                            .filter_map(|d| Some((d.ip?, d.adb_port.unwrap_or(android::ADB_PORT))))
+                            .filter(|(ip, _)| !self.checked.contains(ip))
+                            .collect();
+                        self.mdns = found;
+                        if !unchecked.is_empty() {
+                            return Task::perform(net::probe(unchecked, Duration::from_secs(1)), Message::Probed);
+                        }
+                    }
+                    Err(e) => self.log(format!("mDNS discovery failed: {e}")),
+                }
+            }
+            Message::Pick(ip, port) => {
                 self.ip = ip.to_string();
-                self.port = android::ADB_PORT.to_string();
+                self.port = port.to_string();
                 return self.start_connect();
             }
+            Message::Forget(ip) => {
+                if let Some(d) = self.history.remove(&ip.to_string()) {
+                    self.log(format!("Forgot {}.", d.label));
+                    self.save_history();
+                }
+            }
+            Message::Import => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Import devices.json")
+                            .add_filter("Device history", &["json"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::ImportPicked,
+                );
+            }
+            Message::ImportPicked(None) => {}
+            Message::ImportPicked(Some(path)) => match history::load_from(&path) {
+                Ok(imported) => {
+                    let n = history::merge(&mut self.history, imported);
+                    self.log(format!("Imported {n} device(s) from {}.", path.display()));
+                    self.save_history();
+                    return self.probe_saved();
+                }
+                Err(e) => self.log(format!("Import failed: {e}")),
+            },
             Message::IpChanged(ip) => self.ip = ip,
             Message::PortChanged(port) => self.port = port,
             Message::Connect => return self.start_connect(),
@@ -199,6 +325,15 @@ impl App {
                             "Connected: {label}  |  Android {} (API {})  |  {}",
                             summary.android_version, summary.sdk, summary.abi
                         ));
+                        if let Some((ip, port)) = serial.rsplit_once(':') {
+                            let port = port.parse().unwrap_or(android::ADB_PORT);
+                            history::remember(&mut self.history, ip, port, &label);
+                            self.save_history();
+                            if let Ok(ip) = ip.parse() {
+                                self.open.insert(ip);
+                                self.checked.insert(ip);
+                            }
+                        }
                         self.connection = Some(connection);
                         self.device = Some(Device { platform: Platform::AndroidTv, address: serial, label });
                         self.summary = Some(summary);
@@ -230,37 +365,68 @@ impl App {
         row![self.sidebar(), main].into()
     }
 
+    fn device_list(&self) -> Element<'_, Message> {
+        let now = chrono::Local::now().naive_local();
+        let entries = devices::merge(&self.history, &self.open, &self.checked, &self.mdns, now);
+        if entries.is_empty() {
+            let hint = if self.scanning || self.listening { "Looking for TVs…" } else { "No devices yet. Press Scan." };
+            return text(hint).size(11).color(theme::TEXT_DISABLED).into();
+        }
+        let connected_ip = self.device.as_ref().and_then(|d| d.address.split(':').next());
+        column(entries.into_iter().map(|e| {
+            let connected = connected_ip == Some(e.ip.to_string().as_str());
+            let dot = match (connected, &e.reach) {
+                (true, _) | (_, Reach::Ready) => theme::SUCCESS,
+                (_, Reach::DebuggingOff | Reach::NeedsPairing) => theme::WARNING,
+                (_, Reach::Offline) => theme::TEXT_DISABLED,
+                (_, Reach::Unknown) => theme::TEXT_MUTED,
+            };
+            let label = row![
+                text("●").size(12).color(dot),
+                column![
+                    text(e.title).size(13),
+                    text(e.detail).size(10).color(theme::TEXT_MUTED),
+                ]
+                .spacing(1)
+                .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+            let pick = button(label)
+                .padding([5, 8])
+                .width(Fill)
+                .style(theme::tab_button(connected))
+                .on_press_maybe((!self.connecting).then_some(Message::Pick(e.ip, e.port)));
+            let forget: Element<'_, Message> = if e.saved {
+                button(text("×").size(13))
+                    .padding([2, 6])
+                    .style(theme::tab_button(false))
+                    .on_press(Message::Forget(e.ip))
+                    .into()
+            } else {
+                space().into()
+            };
+            row![pick, forget].spacing(2).align_y(Alignment::Center).into()
+        }))
+        .spacing(2)
+        .into()
+    }
+
     fn sidebar(&self) -> Element<'_, Message> {
         let small = |s: &'static str| text(s).size(11).color(theme::TEXT_DISABLED);
 
-        let scanning = self.scan == ScanState::Scanning;
+        let busy = self.scanning || self.listening;
         let scan_row = row![
             text_input("192.168.1", &self.subnet)
                 .on_input(Message::SubnetChanged)
                 .on_submit(Message::Scan)
                 .size(13),
-            button(text(if scanning { "Scanning…" } else { "Scan" }).size(13))
+            button(text(if busy { "Scanning…" } else { "Scan" }).size(13))
                 .padding([6, 12])
                 .style(theme::secondary_button)
-                .on_press_maybe((!scanning).then_some(Message::Scan)),
+                .on_press_maybe((!self.scanning).then_some(Message::Scan)),
         ]
         .spacing(6);
-
-        let found: Element<'_, Message> = match &self.scan {
-            ScanState::Done(ips) if ips.is_empty() => small("No TVs found on this subnet.").into(),
-            ScanState::Done(ips) => column(ips.iter().map(|&ip| {
-                let connected = self.device.as_ref().is_some_and(|d| d.address.starts_with(&format!("{ip}:")));
-                let label = if connected { format!("●  {ip}") } else { ip.to_string() };
-                button(text(label).size(13).width(Fill))
-                    .padding([6, 10])
-                    .style(theme::tab_button(connected))
-                    .on_press_maybe((!self.connecting).then_some(Message::PickFound(ip)))
-                    .into()
-            }))
-            .spacing(2)
-            .into(),
-            _ => space().into(),
-        };
 
         let connect_button = if self.device.is_some() {
             button(text("Disconnect").center().width(Fill))
@@ -286,9 +452,8 @@ impl App {
 
         let content = column![
             text("Devices").size(16).color(theme::TEXT),
-            small("Find TVs on your network"),
             scan_row,
-            scrollable(found).height(Length::Shrink),
+            scrollable(self.device_list()).height(Fill),
             rule::horizontal(1),
             small("Connect by IP"),
             row![
@@ -305,13 +470,19 @@ impl App {
             .spacing(6),
             connect_button.padding([8, 12]),
             status,
-            space::vertical(),
-            small("Built-in ADB: no adb.exe needed."),
+            row![
+                small("Built-in ADB: no adb.exe needed.").width(Fill),
+                button(text("Import…").size(11))
+                    .padding([2, 6])
+                    .style(theme::tab_button(false))
+                    .on_press(Message::Import),
+            ]
+            .align_y(Alignment::Center),
         ]
         .spacing(10)
         .padding(14);
 
-        container(content).width(260).height(Fill).style(theme::sidebar).into()
+        container(content).width(280).height(Fill).style(theme::sidebar).into()
     }
 
     fn tab_bar(&self) -> Element<'_, Message> {
@@ -342,7 +513,7 @@ impl App {
         let Some(s) = &self.summary else {
             return empty_state(
                 "No TV connected",
-                "Scan your network in the sidebar, or enter the TV's IP address and press Connect.",
+                "Pick a TV in the sidebar, or enter its IP address and press Connect.",
             );
         };
         let or_dash = |v: &str| if v.is_empty() { "—".to_owned() } else { v.to_owned() };
@@ -406,7 +577,7 @@ fn empty_state<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
             text(subtitle.to_owned()).size(12).color(theme::TEXT_MUTED),
         ]
         .spacing(6)
-        .align_x(iced::Alignment::Center),
+        .align_x(Alignment::Center),
     )
     .center(Fill)
     .into()

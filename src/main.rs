@@ -2,19 +2,21 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod android;
-mod config;
+mod net;
 mod platform;
 mod theme;
 
-use std::path::PathBuf;
+use std::net::Ipv4Addr;
+use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
+use iced::widget::{button, column, container, row, rule, scrollable, space, text, text_input};
 use iced::{Element, Fill, Font, Length, Task, Theme};
 
-use android::{ConnectResult, DeviceSummary, adb};
+use android::{ConnectResult, Connection, DeviceSummary};
 use platform::{Device, Platform};
 
-const PLATFORM_TOOLS_URL: &str = "https://developer.android.com/tools/releases/platform-tools";
+/// How long each host gets to answer during a network scan.
+const SCAN_TIMEOUT: Duration = Duration::from_millis(600);
 
 pub fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
@@ -66,39 +68,21 @@ impl Tab {
     }
 }
 
-/// Where the app stands with ADB.
-#[derive(Debug, Clone)]
-enum AdbStatus {
-    Starting,
-    Ready { path: PathBuf, version: String },
-    Missing,
-    Broken { path: PathBuf, error: String },
-}
-
-impl AdbStatus {
-    /// The working adb, if any.
-    fn path(&self) -> Option<&PathBuf> {
-        match self {
-            AdbStatus::Ready { path, .. } => Some(path),
-            _ => None,
-        }
-    }
-
-    /// Where the file picker should open: next to the current or failed adb.
-    fn last_dir(&self) -> Option<&std::path::Path> {
-        match self {
-            AdbStatus::Ready { path, .. } | AdbStatus::Broken { path, .. } => path.parent(),
-            _ => None,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanState {
+    Idle,
+    Scanning,
+    Done(Vec<Ipv4Addr>),
 }
 
 struct App {
-    adb: AdbStatus,
+    subnet: String,
+    scan: ScanState,
     ip: String,
     port: String,
     connecting: bool,
     connect_hint: Option<String>,
+    connection: Option<Connection>,
     device: Option<Device>,
     summary: Option<DeviceSummary>,
     tab: Tab,
@@ -107,40 +91,34 @@ struct App {
 
 #[derive(Debug, Clone)]
 enum Message {
-    AdbStarted(PathBuf, Result<String, String>),
-    ChangeAdb,
-    AdbPicked(Option<PathBuf>),
-    OpenPlatformToolsPage,
+    SubnetChanged(String),
+    Scan,
+    ScanFinished(Vec<Ipv4Addr>),
+    PickFound(Ipv4Addr),
     IpChanged(String),
     PortChanged(String),
     Connect,
     Connected(ConnectResult),
     Disconnect,
-    Disconnected(String),
     TabSelected(Tab),
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
-        let mut app = App {
-            adb: AdbStatus::Missing,
+    fn new() -> Self {
+        let subnet = net::local_ipv4().map(net::subnet_prefix).unwrap_or_else(|| "192.168.1".into());
+        App {
+            subnet,
+            scan: ScanState::Idle,
             ip: String::new(),
-            port: "5555".into(),
+            port: android::ADB_PORT.to_string(),
             connecting: false,
             connect_hint: None,
+            connection: None,
             device: None,
             summary: None,
             tab: Tab::Info,
-            log: Vec::new(),
-        };
-        let task = match adb::find() {
-            Some(path) => app.start_adb(path),
-            None => {
-                app.log("ADB not found. Choose its location in the sidebar.");
-                Task::none()
-            }
-        };
-        (app, task)
+            log: vec!["Ready. Scan your network or enter the TV's IP address.".into()],
+        }
     }
 
     fn title(&self) -> String {
@@ -158,83 +136,77 @@ impl App {
         self.log.push(line.into());
     }
 
-    fn start_adb(&mut self, path: PathBuf) -> Task<Message> {
-        self.adb = AdbStatus::Starting;
-        Task::perform(android::start_server(path.clone()), move |r| {
-            Message::AdbStarted(path.clone(), r)
-        })
+    fn start_connect(&mut self) -> Task<Message> {
+        if self.ip.trim().is_empty() {
+            self.log("Enter the TV's IP address first.");
+            return Task::none();
+        }
+        // Switching TVs: drop the old connection first.
+        self.disconnect();
+        let serial = android::serial_for(&self.ip, &self.port);
+        self.log(format!("Connecting to {serial}…"));
+        self.connecting = true;
+        self.connect_hint = None;
+        Task::perform(android::connect(serial), Message::Connected)
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(device) = self.device.take() {
+            self.log(format!("Disconnected from {}.", device.label));
+        }
+        self.connection = None;
+        self.summary = None;
+        self.tab = Tab::Info;
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::AdbStarted(path, Ok(version)) => {
-                self.log(format!("ADB ready: {version}"));
-                self.log(format!("Using {}", path.display()));
-                if let Err(e) = config::save_adb_path(&path) {
-                    self.log(format!("Could not save the ADB location: {e}"));
-                }
-                self.adb = AdbStatus::Ready { path, version };
-            }
-            Message::AdbStarted(path, Err(error)) => {
-                self.log(format!("ADB at {} failed: {error}", path.display()));
-                self.adb = AdbStatus::Broken { path, error };
-            }
-            Message::ChangeAdb => {
-                let mut dialog = rfd::AsyncFileDialog::new().set_title("Locate adb");
-                if cfg!(windows) {
-                    dialog = dialog.add_filter("ADB executable", &["exe"]);
-                }
-                if let Some(dir) = self.adb.last_dir() {
-                    dialog = dialog.set_directory(dir);
-                }
+            Message::SubnetChanged(subnet) => self.subnet = subnet,
+            Message::Scan => {
+                let Some(prefix) = net::parse_prefix(&self.subnet) else {
+                    self.log("Enter a subnet like 192.168.1 to scan.");
+                    return Task::none();
+                };
+                let [a, b, c] = prefix;
+                self.log(format!("Scanning {a}.{b}.{c}.1–254 for TVs (port {})…", android::ADB_PORT));
+                self.scan = ScanState::Scanning;
                 return Task::perform(
-                    async move { dialog.pick_file().await.map(|f| f.path().to_path_buf()) },
-                    Message::AdbPicked,
+                    net::scan(prefix, android::ADB_PORT, SCAN_TIMEOUT),
+                    Message::ScanFinished,
                 );
             }
-            Message::AdbPicked(None) => {}
-            Message::AdbPicked(Some(picked)) => match adb::resolve(&picked) {
-                Some(path) => return self.start_adb(path),
-                None => self.log(format!("No {} at {}", adb::ADB_NAME, picked.display())),
-            },
-            Message::OpenPlatformToolsPage => {
-                if let Err(e) = open::that(PLATFORM_TOOLS_URL) {
-                    self.log(format!("Could not open the browser: {e}"));
-                }
+            Message::ScanFinished(found) => {
+                self.log(match found.len() {
+                    0 => "No TVs found. Check that network debugging is on, or enter the IP.".to_owned(),
+                    n => format!("Found {n} device(s) with ADB open."),
+                });
+                self.scan = ScanState::Done(found);
+            }
+            Message::PickFound(ip) => {
+                self.ip = ip.to_string();
+                self.port = android::ADB_PORT.to_string();
+                return self.start_connect();
             }
             Message::IpChanged(ip) => self.ip = ip,
             Message::PortChanged(port) => self.port = port,
-            Message::Connect => {
-                let Some(path) = self.adb.path().cloned() else {
-                    self.log("Set up ADB first (sidebar).");
-                    return Task::none();
-                };
-                if self.ip.trim().is_empty() {
-                    self.log("Enter the TV's IP address first.");
-                    return Task::none();
-                }
-                let serial = android::serial_for(&self.ip, &self.port);
-                self.log(format!("Connecting to {serial}…"));
-                self.connecting = true;
-                self.connect_hint = None;
-                return Task::perform(android::connect(path, serial), Message::Connected);
-            }
+            Message::Connect => return self.start_connect(),
             Message::Connected(result) => {
                 self.connecting = false;
                 match result {
-                    ConnectResult::Connected { serial, summary } => {
+                    ConnectResult::Connected { serial, connection, summary } => {
                         let label = summary.label();
                         self.log(format!(
                             "Connected: {label}  |  Android {} (API {})  |  {}",
                             summary.android_version, summary.sdk, summary.abi
                         ));
+                        self.connection = Some(connection);
                         self.device = Some(Device { platform: Platform::AndroidTv, address: serial, label });
                         self.summary = Some(summary);
                     }
-                    ConnectResult::NeedsApproval(out) => {
-                        self.log(out);
+                    ConnectResult::NeedsApproval => {
+                        self.log("The TV hasn't allowed debugging from this computer yet.");
                         self.connect_hint = Some(
-                            "Accept \"Allow debugging?\" on the TV, then press Connect again.".into(),
+                            "On the TV, choose Allow (tick \"Always allow\"), then press Connect again.".into(),
                         );
                     }
                     ConnectResult::Failed(out) => {
@@ -245,14 +217,7 @@ impl App {
                     }
                 }
             }
-            Message::Disconnect => {
-                if let (Some(device), Some(path)) = (self.device.take(), self.adb.path().cloned()) {
-                    self.summary = None;
-                    self.tab = Tab::Info;
-                    return Task::perform(android::disconnect(path, device.address), Message::Disconnected);
-                }
-            }
-            Message::Disconnected(out) => self.log(out),
+            Message::Disconnect => self.disconnect(),
             Message::TabSelected(tab) => self.tab = tab,
         }
         Task::none()
@@ -267,6 +232,35 @@ impl App {
 
     fn sidebar(&self) -> Element<'_, Message> {
         let small = |s: &'static str| text(s).size(11).color(theme::TEXT_DISABLED);
+
+        let scanning = self.scan == ScanState::Scanning;
+        let scan_row = row![
+            text_input("192.168.1", &self.subnet)
+                .on_input(Message::SubnetChanged)
+                .on_submit(Message::Scan)
+                .size(13),
+            button(text(if scanning { "Scanning…" } else { "Scan" }).size(13))
+                .padding([6, 12])
+                .style(theme::secondary_button)
+                .on_press_maybe((!scanning).then_some(Message::Scan)),
+        ]
+        .spacing(6);
+
+        let found: Element<'_, Message> = match &self.scan {
+            ScanState::Done(ips) if ips.is_empty() => small("No TVs found on this subnet.").into(),
+            ScanState::Done(ips) => column(ips.iter().map(|&ip| {
+                let connected = self.device.as_ref().is_some_and(|d| d.address.starts_with(&format!("{ip}:")));
+                let label = if connected { format!("●  {ip}") } else { ip.to_string() };
+                button(text(label).size(13).width(Fill))
+                    .padding([6, 10])
+                    .style(theme::tab_button(connected))
+                    .on_press_maybe((!self.connecting).then_some(Message::PickFound(ip)))
+                    .into()
+            }))
+            .spacing(2)
+            .into(),
+            _ => space().into(),
+        };
 
         let connect_button = if self.device.is_some() {
             button(text("Disconnect").center().width(Fill))
@@ -292,6 +286,10 @@ impl App {
 
         let content = column![
             text("Devices").size(16).color(theme::TEXT),
+            small("Find TVs on your network"),
+            scan_row,
+            scrollable(found).height(Length::Shrink),
+            rule::horizontal(1),
             small("Connect by IP"),
             row![
                 text_input("192.168.1.x", &self.ip)
@@ -308,68 +306,12 @@ impl App {
             connect_button.padding([8, 12]),
             status,
             space::vertical(),
-            self.adb_status(),
+            small("Built-in ADB: no adb.exe needed."),
         ]
         .spacing(10)
         .padding(14);
 
         container(content).width(260).height(Fill).style(theme::sidebar).into()
-    }
-
-    fn adb_status(&self) -> Element<'_, Message> {
-        let change = |label| {
-            button(text(label).size(11))
-                .padding(0)
-                .style(theme::link_button)
-                .on_press(Message::ChangeAdb)
-        };
-        match &self.adb {
-            AdbStatus::Ready { path, version } => {
-                let short = match (path.parent().and_then(|p| p.file_name()), path.file_name()) {
-                    (Some(dir), Some(file)) => {
-                        format!("{}{}{}", dir.to_string_lossy(), std::path::MAIN_SEPARATOR, file.to_string_lossy())
-                    }
-                    _ => path.display().to_string(),
-                };
-                column![
-                    row![
-                        text(format!("ADB: {short}")).size(10).color(theme::TEXT_DISABLED).width(Fill),
-                        change("Change…"),
-                    ],
-                    text(version).size(10).color(theme::TEXT_DISABLED),
-                ]
-                .spacing(2)
-                .into()
-            }
-            AdbStatus::Starting => text("Starting ADB…").size(10).color(theme::TEXT_DISABLED).into(),
-            AdbStatus::Missing | AdbStatus::Broken { .. } => {
-                let reason = match &self.adb {
-                    AdbStatus::Broken { error, .. } => format!("ADB isn't working: {error}"),
-                    _ => "ADB not found.".into(),
-                };
-                container(
-                    column![
-                        text(reason).size(12).color(theme::DANGER),
-                        text("Pick adb, or the platform-tools folder that contains it.")
-                            .size(11)
-                            .color(theme::TEXT_MUTED),
-                        row![
-                            button(text("Choose…").size(12))
-                                .style(theme::secondary_button)
-                                .on_press(Message::ChangeAdb),
-                            button(text("Download").size(12))
-                                .style(theme::link_button)
-                                .on_press(Message::OpenPlatformToolsPage),
-                        ]
-                        .spacing(8),
-                    ]
-                    .spacing(6),
-                )
-                .padding(10)
-                .style(theme::panel)
-                .into()
-            }
-        }
     }
 
     fn tab_bar(&self) -> Element<'_, Message> {
@@ -398,7 +340,10 @@ impl App {
 
     fn info_tab(&self) -> Element<'_, Message> {
         let Some(s) = &self.summary else {
-            return empty_state("No TV connected", "Enter your TV's IP address in the sidebar and press Connect.");
+            return empty_state(
+                "No TV connected",
+                "Scan your network in the sidebar, or enter the TV's IP address and press Connect.",
+            );
         };
         let or_dash = |v: &str| if v.is_empty() { "—".to_owned() } else { v.to_owned() };
         let android = match (s.android_version.is_empty(), s.sdk.is_empty()) {
@@ -414,26 +359,30 @@ impl App {
         ];
         let fields = column(rows.into_iter().map(|(label, value)| {
             row![
-                text(format!("{label}:")).size(13).color(theme::TEXT_MUTED).width(150).align_x(iced::alignment::Horizontal::Right),
+                text(format!("{label}:"))
+                    .size(13)
+                    .color(theme::TEXT_MUTED)
+                    .width(150)
+                    .align_x(iced::alignment::Horizontal::Right),
                 text(value).size(13).color(theme::TEXT),
             ]
             .spacing(12)
             .into()
         }))
         .spacing(10);
-        let card = container(
-            column![text("Device").size(12).color(theme::TEXT_MUTED), fields].spacing(10),
-        )
-        .padding(16)
-        .width(Fill)
-        .style(theme::panel);
+        let card = container(column![text("Device").size(12).color(theme::TEXT_MUTED), fields].spacing(10))
+            .padding(16)
+            .width(Fill)
+            .style(theme::panel);
         scrollable(column![card].padding(4)).into()
     }
 
     fn log_panel(&self) -> Element<'_, Message> {
-        let lines = column(self.log.iter().map(|l| {
-            text(l).size(12).font(Font::MONOSPACE).color(theme::TEXT).into()
-        }))
+        let lines = column(
+            self.log
+                .iter()
+                .map(|l| text(l).size(12).font(Font::MONOSPACE).color(theme::TEXT).into()),
+        )
         .spacing(2);
         container(
             column![

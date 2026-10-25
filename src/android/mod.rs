@@ -1,15 +1,18 @@
 //! Android TV / Google TV support, over ADB.
 
-pub mod adb;
+pub mod transport;
 
-use std::path::{Path, PathBuf};
+pub use transport::Connection;
 
-/// Outcome of `adb connect`.
+/// ADB's network debugging port.
+pub const ADB_PORT: u16 = 5555;
+
+/// Outcome of connecting to a TV.
 #[derive(Debug, Clone)]
 pub enum ConnectResult {
-    Connected { serial: String, summary: DeviceSummary },
-    /// The TV is showing "Allow USB debugging?"; the user must accept it.
-    NeedsApproval(String),
+    Connected { serial: String, connection: Connection, summary: DeviceSummary },
+    /// The TV is showing "Allow debugging?"; the user must accept it.
+    NeedsApproval,
     Failed(String),
 }
 
@@ -77,50 +80,25 @@ pub fn serial_for(address: &str, port: &str) -> String {
     }
 }
 
-pub async fn connect(adb: PathBuf, serial: String) -> ConnectResult {
-    let out = match adb::run(&adb, None, &["connect", &serial], adb::SHORT).await {
-        Ok(out) => out,
+pub async fn connect(serial: String) -> ConnectResult {
+    let connection = match transport::connect(serial.clone()).await {
+        Ok(c) => c,
+        Err(transport::Error::NeedsApproval) => return ConnectResult::NeedsApproval,
         Err(e) => return ConnectResult::Failed(e.to_string()),
     };
-    let lower = out.to_lowercase();
-    if lower.contains("failed to authenticate") || lower.contains("unauthorized") {
-        return ConnectResult::NeedsApproval(out);
-    }
-    if !(lower.contains("connected to") || lower.contains("already connected")) {
-        return ConnectResult::Failed(out);
-    }
-    match fetch_summary(&adb, &serial).await {
-        Ok(summary) => ConnectResult::Connected { serial, summary },
-        // Connected at the TCP level but the shell is not usable yet: this is
-        // what an unanswered "Allow debugging?" prompt looks like.
-        Err(e) if e.contains("unauthorized") => ConnectResult::NeedsApproval(e),
+    match fetch_summary(&connection).await {
+        Ok(summary) => ConnectResult::Connected { serial, connection, summary },
         Err(e) => ConnectResult::Failed(e),
     }
 }
 
-async fn fetch_summary(adb: &Path, serial: &str) -> Result<DeviceSummary, String> {
-    let raw = adb::run(adb, Some(serial), &["shell", "getprop"], adb::SHORT)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn fetch_summary(connection: &Connection) -> Result<DeviceSummary, String> {
+    let raw = connection.shell("getprop", transport::SHORT).await.map_err(|e| e.to_string())?;
     let props = parse_getprop(&raw);
     if props.is_empty() {
         return Err(raw);
     }
     Ok(summary_from_props(&props))
-}
-
-pub async fn disconnect(adb: PathBuf, serial: String) -> String {
-    adb::run(&adb, None, &["disconnect", &serial], adb::SHORT)
-        .await
-        .unwrap_or_else(|e| e.to_string())
-}
-
-pub async fn start_server(adb: PathBuf) -> Result<String, String> {
-    let version = adb::verify(&adb).await?;
-    adb::run(&adb, None, &["start-server"], adb::SHORT)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(version)
 }
 
 #[cfg(test)]
@@ -161,11 +139,9 @@ mod tests {
     #[ignore]
     fn live_connect() {
         let serial = std::env::var("STT_TEST_TV").expect("set STT_TEST_TV=ip:port");
-        let adb = adb::find().expect("adb not found");
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            println!("{}", start_server(adb.clone()).await.expect("adb start"));
-            match connect(adb, serial).await {
+            match connect(serial).await {
                 ConnectResult::Connected { summary, .. } => {
                     println!("{summary:?}\nlabel: {}", summary.label());
                     assert!(!summary.manufacturer.is_empty());

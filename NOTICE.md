@@ -22,6 +22,5 @@ Software Foundation, version 3. It is distributed WITHOUT ANY WARRANTY; see
 
 - [iced](https://iced.rs) and the other Rust crates in `Cargo.toml` are used
   under their own licenses (mostly MIT and/or Apache-2.0).
-- ADB (Android SDK Platform-Tools) is not bundled in this repository. If a
-  release ships it, it is distributed under Google's own license terms, which
-  must accompany it.
+- The ADB protocol is implemented by the [adb_client](https://github.com/cocool97/adb_client)
+  crate (MIT). No Android SDK Platform-Tools binaries are included or required.

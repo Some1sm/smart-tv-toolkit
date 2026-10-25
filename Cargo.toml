@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+adb_client = { version = "3.2", default-features = false }
 dirs = "7"
 iced = { version = "0.14", features = ["tokio"] }
-open = "5"
-rfd = "0.17"
+rsa = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["process", "time", "macros", "rt"] }
+tokio = { version = "1", features = ["time", "macros", "rt", "net"] }

@@ -89,15 +89,6 @@ pub fn danger_button(_: &Theme, status: button::Status) -> button::Style {
     button_style(DANGER_BG, color!(0x4a3035), DANGER, color!(0x5a3439), status)
 }
 
-/// A link-like button with no background, e.g. "Change…".
-pub fn link_button(_: &Theme, status: button::Status) -> button::Style {
-    let text_color = match status {
-        button::Status::Hovered | button::Status::Pressed => TEXT,
-        _ => PRIMARY,
-    };
-    button::Style { text_color, ..Default::default() }
-}
-
 pub fn tab_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);

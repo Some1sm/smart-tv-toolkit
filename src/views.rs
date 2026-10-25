@@ -447,3 +447,133 @@ pub fn install(v: InstallView<'_>) -> Element<'_, Message> {
 
     scrollable(column![apk, quick, shizuku].spacing(8).padding(4)).into()
 }
+
+// ── Remote ───────────────────────────────────────────────────────────────────
+
+pub fn remote<'a>() -> Element<'a, Message> {
+    use crate::android::remote::*;
+    let b = |key: Key, style: fn(&iced::Theme, button::Status) -> button::Style| -> Element<'a, Message> {
+        button(text(key.label).size(15).center().width(Fill).height(Fill))
+            .width(100)
+            .height(48)
+            .style(style)
+            .on_press(Message::RemoteKey(key))
+            .into()
+    };
+    let key = |k: Key| b(k, theme::secondary_button);
+    let gap = || -> Element<'a, Message> { space().width(100).height(48).into() };
+
+    let pad = column![
+        row![gap(), key(UP), gap(), key(VOLUME_UP)].spacing(8),
+        row![key(LEFT), b(OK, theme::primary_button), key(RIGHT), key(MUTE)].spacing(8),
+        row![gap(), key(DOWN), gap(), key(VOLUME_DOWN)].spacing(8),
+        space().height(8),
+        row![key(BACK), key(HOME), key(MENU), gap()].spacing(8),
+        row![key(PREVIOUS), key(PLAY_PAUSE), key(NEXT), gap()].spacing(8),
+        space().height(8),
+        row![gap(), b(POWER, theme::danger_button), gap(), gap()].spacing(8),
+    ]
+    .spacing(8);
+
+    let hint = text(
+        "Keyboard works too while this tab is open: arrow keys, Enter = OK, Backspace or Esc = Back, \
+         Home, Space = play/pause, + and − = volume, M = mute.",
+    )
+    .size(12)
+    .color(theme::TEXT_MUTED);
+
+    scrollable(
+        column![container(pad).padding(20).style(theme::panel), hint]
+            .spacing(12)
+            .padding(4)
+            .align_x(Alignment::Center)
+            .width(Fill),
+    )
+    .into()
+}
+
+/// Map a key press on the computer to a TV remote key (Remote tab only).
+pub fn remote_key(event: iced::keyboard::Event) -> Option<Message> {
+    use crate::android::remote::*;
+    use iced::keyboard::{Event, Key as K, key::Named};
+    let Event::KeyPressed { key, repeat: false, .. } = event else { return None };
+    let tv = match key.as_ref() {
+        K::Named(Named::ArrowUp) => UP,
+        K::Named(Named::ArrowDown) => DOWN,
+        K::Named(Named::ArrowLeft) => LEFT,
+        K::Named(Named::ArrowRight) => RIGHT,
+        K::Named(Named::Enter) => OK,
+        K::Named(Named::Backspace | Named::Escape) => BACK,
+        K::Named(Named::Home) => HOME,
+        K::Named(Named::Space | Named::MediaPlayPause) => PLAY_PAUSE,
+        K::Named(Named::AudioVolumeUp) | K::Character("+" | "=") => VOLUME_UP,
+        K::Named(Named::AudioVolumeDown) | K::Character("-") => VOLUME_DOWN,
+        K::Named(Named::AudioVolumeMute) | K::Character("m" | "M") => MUTE,
+        _ => return None,
+    };
+    Some(Message::RemoteKey(tv))
+}
+
+// ── Screenshot ───────────────────────────────────────────────────────────────
+
+pub fn screenshot<'a>(shot: Option<&'a iced::widget::image::Handle>, status: &'a str, busy: bool) -> Element<'a, Message> {
+    let buttons = row![
+        button(text(if busy { "Capturing…" } else { "Take Screenshot" }).size(13))
+            .padding([8, 16])
+            .style(theme::primary_button)
+            .on_press_maybe((!busy).then_some(Message::TakeScreenshot)),
+        button(text("Save As…").size(13))
+            .padding([8, 16])
+            .style(theme::secondary_button)
+            .on_press_maybe(shot.is_some().then_some(Message::SaveScreenshot)),
+        text(status).size(12).color(theme::TEXT_MUTED),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let view: Element<'a, Message> = match shot {
+        Some(handle) => iced::widget::image(handle.clone()).content_fit(iced::ContentFit::Contain).width(Fill).height(Fill).into(),
+        None => empty_state("No screenshot yet", "Press Take Screenshot to capture what's on the TV."),
+    };
+    column![buttons, container(view).padding(8).width(Fill).height(Fill).style(theme::panel)]
+        .spacing(8)
+        .padding(4)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::android::remote;
+    use iced::keyboard::{Event, Key, Location, Modifiers, key};
+
+    fn press(k: Key, repeat: bool) -> Event {
+        Event::KeyPressed {
+            key: k.clone(),
+            modified_key: k,
+            physical_key: key::Physical::Code(key::Code::KeyA),
+            location: Location::Standard,
+            modifiers: Modifiers::default(),
+            text: None,
+            repeat,
+        }
+    }
+
+    fn tv(event: Event) -> Option<u16> {
+        match remote_key(event) {
+            Some(Message::RemoteKey(k)) => Some(k.code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn keyboard_maps_to_remote_keys_and_ignores_repeats() {
+        assert_eq!(tv(press(Key::Named(key::Named::ArrowUp), false)), Some(remote::UP.code));
+        assert_eq!(tv(press(Key::Named(key::Named::Escape), false)), Some(remote::BACK.code));
+        assert_eq!(tv(press(Key::Character("+".into()), false)), Some(remote::VOLUME_UP.code));
+        assert_eq!(tv(press(Key::Character("m".into()), false)), Some(remote::MUTE.code));
+        // Holding a key must not queue dozens of slow `input keyevent` calls.
+        assert_eq!(tv(press(Key::Named(key::Named::ArrowUp), true)), None);
+        assert_eq!(tv(press(Key::Character("x".into()), false)), None);
+    }
+}

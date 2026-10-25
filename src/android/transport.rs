@@ -100,6 +100,22 @@ impl Connection {
         }
     }
 
+    /// Read a file from the TV into memory.
+    pub async fn pull_bytes(&self, remote: String, timeout: Duration) -> Result<Vec<u8>, Error> {
+        let device = self.device.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
+            device.pull(&remote, &mut bytes).map_err(adb_error)?;
+            Ok(bytes)
+        });
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(Error::Adb(join.to_string())),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
+
     /// Copy a file from the TV to `local`. A partial file is removed on failure.
     pub async fn pull(&self, remote: String, local: PathBuf, timeout: Duration) -> Result<u64, Error> {
         let device = self.device.clone();

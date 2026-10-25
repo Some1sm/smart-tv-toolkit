@@ -21,7 +21,7 @@ use iced::{Alignment, Element, Fill, Font, Length, Task, Theme};
 
 use android::health::{self, Finding, Fix};
 use android::packages::{self, Action, ListKind, Package};
-use android::{catalog, install, shizuku};
+use android::{catalog, install, remote, shizuku};
 use android::sysinfo::{self, Section};
 use android::{ConnectResult, Connection};
 use devices::Reach;
@@ -38,6 +38,7 @@ pub fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
+        .subscription(App::subscription)
         .window_size((1100.0, 700.0))
         .centered()
         .run()
@@ -115,6 +116,10 @@ struct App {
     abis: Vec<String>,
     downloading: BTreeSet<&'static str>,
     install_busy: bool,
+    /// Last screenshot: decoded handle for display, PNG bytes for saving.
+    screenshot: Option<(iced::widget::image::Handle, Vec<u8>)>,
+    screenshot_status: String,
+    capturing: bool,
     tab: Tab,
     log: Vec<String>,
 }
@@ -173,6 +178,12 @@ enum Message {
     ShizukuStart,
     InstallResult(Result<String, String>),
     OpenUrl(&'static str),
+    RemoteKey(remote::Key),
+    RemoteDone(Result<(), String>),
+    TakeScreenshot,
+    ScreenshotTaken(Result<Vec<u8>, String>),
+    SaveScreenshot,
+    ScreenshotSaveTo(Option<PathBuf>),
 }
 
 impl App {
@@ -207,6 +218,9 @@ impl App {
             abis: Vec::new(),
             downloading: BTreeSet::new(),
             install_busy: false,
+            screenshot: None,
+            screenshot_status: String::new(),
+            capturing: false,
             tab: Tab::Info,
             log: Vec::new(),
         };
@@ -228,6 +242,16 @@ impl App {
 
     fn theme(&self) -> Theme {
         theme::app_theme()
+    }
+
+    /// While the Remote tab is open, the computer's keyboard drives the TV.
+    /// Only keys no widget used arrive here, so typing in a field is safe.
+    fn subscription(&self) -> iced::Subscription<Message> {
+        if self.tab == Tab::Remote && self.connection.is_some() {
+            iced::keyboard::listen().filter_map(views::remote_key)
+        } else {
+            iced::Subscription::none()
+        }
     }
 
     fn log(&mut self, line: impl Into<String>) {
@@ -688,6 +712,57 @@ impl App {
                     self.log(format!("Could not open the browser: {e}"));
                 }
             }
+            Message::RemoteKey(key) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                return Task::perform(remote::press(conn, key), Message::RemoteDone);
+            }
+            Message::RemoteDone(Ok(())) => {}
+            Message::RemoteDone(Err(e)) => self.log(format!("Remote: {e}")),
+            Message::TakeScreenshot => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.capturing = true;
+                self.screenshot_status = "Capturing…".into();
+                return Task::perform(remote::screenshot(conn), Message::ScreenshotTaken);
+            }
+            Message::ScreenshotTaken(result) => {
+                self.capturing = false;
+                match result {
+                    Ok(png) => {
+                        let time = chrono::Local::now().format("%H:%M:%S");
+                        self.screenshot_status = format!("Captured at {time} ({}).", sysinfo::fmt_bytes(png.len() as u64));
+                        self.screenshot = Some((iced::widget::image::Handle::from_bytes(png.clone()), png));
+                    }
+                    Err(e) => {
+                        self.screenshot_status = "Capture failed; see the log.".into();
+                        self.log(format!("Screenshot failed: {e}"));
+                    }
+                }
+            }
+            Message::SaveScreenshot => {
+                let name = format!("screenshot-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Save screenshot")
+                            .set_file_name(name)
+                            .add_filter("PNG image", &["png"])
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::ScreenshotSaveTo,
+                );
+            }
+            Message::ScreenshotSaveTo(None) => {}
+            Message::ScreenshotSaveTo(Some(path)) => {
+                if let Some((_, png)) = &self.screenshot {
+                    let result = std::fs::write(&path, png);
+                    self.log(match result {
+                        Ok(()) => format!("Saved {}", path.display()),
+                        Err(e) => format!("Could not save {}: {e}", path.display()),
+                    });
+                }
+            }
         }
         Task::none()
     }
@@ -843,6 +918,10 @@ impl App {
                     Health::Done { findings, scanned_at } => views::HealthState::Done { findings, scanned_at },
                 };
                 views::performance(state, self.fixing)
+            }
+            Tab::Remote => views::remote(),
+            Tab::Screenshot => {
+                views::screenshot(self.screenshot.as_ref().map(|(h, _)| h), &self.screenshot_status, self.capturing)
             }
             Tab::Install => views::install(views::InstallView {
                 abis: &self.abis,

@@ -7,7 +7,7 @@ edition = "2024"
 adb_client = { version = "3.2", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "7"
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "image"] }
 mdns-sd = "0.21"
 open = "5"
 rfd = "0.17"

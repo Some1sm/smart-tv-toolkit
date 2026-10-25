@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod health;
 pub mod install;
 pub mod packages;
+pub mod remote;
 pub mod shizuku;
 pub mod sysinfo;
 pub mod transport;

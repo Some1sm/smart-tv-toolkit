@@ -1,6 +1,6 @@
 //! One Dark colours and the widget styles built from them.
 
-use iced::widget::{button, container};
+use iced::widget::{button, container, progress_bar};
 use iced::{Background, Border, Color, Shadow, Theme, color};
 
 pub const APP_BG: Color = color!(0x282c34);
@@ -51,6 +51,31 @@ pub fn panel(_: &Theme) -> container::Style {
         background: bg(SURFACE_1),
         border: Border { color: BORDER, width: 1.0, radius: RADIUS_XL.into() },
         ..Default::default()
+    }
+}
+
+/// A lighter card inside a panel, e.g. one Health Check finding.
+pub fn card(_: &Theme) -> container::Style {
+    container::Style {
+        background: bg(SURFACE_2),
+        border: Border { color: BORDER, width: 1.0, radius: RADIUS_MD.into() },
+        ..Default::default()
+    }
+}
+
+/// A usage bar that turns amber at 75% and red at 90%.
+pub fn usage_bar(fraction: f32) -> impl Fn(&Theme) -> progress_bar::Style {
+    let color = if fraction >= 0.9 {
+        DANGER
+    } else if fraction >= 0.75 {
+        WARNING
+    } else {
+        PRIMARY
+    };
+    move |_| progress_bar::Style {
+        background: Background::Color(SURFACE_3),
+        bar: Background::Color(color),
+        border: Border { radius: 4.0.into(), ..Default::default() },
     }
 }
 

@@ -52,7 +52,7 @@ or **x64 Native Tools** prompt so the MSVC environment is set.
 1. Foundation: window, sidebar and tabs, built-in ADB (no adb.exe), connect by IP ✅
 2. Devices: network scan ✅, mDNS discovery ✅, device history ✅ (imports the original's
    `devices.json`), wireless pairing
-3. Info tab and Health Check
+3. Info tab and Health Check ✅
 4. Packages, Install, Performance, Settings, Tools, Media, Remote, Files
 5. Packaging: single executable, automated builds for Windows and macOS
 

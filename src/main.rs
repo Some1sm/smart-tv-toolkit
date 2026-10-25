@@ -9,6 +9,7 @@ mod mdns;
 mod net;
 mod platform;
 mod theme;
+mod views;
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -18,7 +19,9 @@ use std::time::Duration;
 use iced::widget::{button, column, container, row, rule, scrollable, space, text, text_input};
 use iced::{Alignment, Element, Fill, Font, Length, Task, Theme};
 
-use android::{ConnectResult, Connection, DeviceSummary};
+use android::health::{self, Finding, Fix};
+use android::sysinfo::{self, Section};
+use android::{ConnectResult, Connection};
 use devices::Reach;
 use history::History;
 use mdns::MdnsDevice;
@@ -94,9 +97,19 @@ struct App {
     connect_hint: Option<String>,
     connection: Option<Connection>,
     device: Option<Device>,
-    summary: Option<DeviceSummary>,
+    info: Option<Vec<Section>>,
+    info_loading: bool,
+    health: Health,
+    fixing: bool,
     tab: Tab,
     log: Vec<String>,
+}
+
+enum Health {
+    Idle,
+    Scanning,
+    Failed(String),
+    Done { findings: Vec<Finding>, scanned_at: String },
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +129,14 @@ enum Message {
     Connected(ConnectResult),
     Disconnect,
     TabSelected(Tab),
+    RefreshInfo,
+    InfoLoaded(Result<Vec<Section>, String>),
+    CopyInfo,
+    RunHealthCheck,
+    HealthScanned(Result<Vec<Finding>, String>),
+    FixPressed(Fix),
+    FixConfirmed(Fix, bool),
+    FixApplied(Result<String, String>),
 }
 
 impl App {
@@ -136,7 +157,10 @@ impl App {
             connect_hint: None,
             connection: None,
             device: None,
-            summary: None,
+            info: None,
+            info_loading: false,
+            health: Health::Idle,
+            fixing: false,
             tab: Tab::Info,
             log: Vec::new(),
         };
@@ -206,8 +230,21 @@ impl App {
             self.log(format!("Disconnected from {}.", device.label));
         }
         self.connection = None;
-        self.summary = None;
+        self.info = None;
+        self.health = Health::Idle;
         self.tab = Tab::Info;
+    }
+
+    fn load_info(&mut self) -> Task<Message> {
+        let Some(conn) = self.connection.clone() else { return Task::none() };
+        self.info_loading = true;
+        Task::perform(sysinfo::collect(conn), Message::InfoLoaded)
+    }
+
+    fn run_health_check(&mut self) -> Task<Message> {
+        let Some(conn) = self.connection.clone() else { return Task::none() };
+        self.health = Health::Scanning;
+        Task::perform(health::scan(conn), Message::HealthScanned)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -336,7 +373,7 @@ impl App {
                         }
                         self.connection = Some(connection);
                         self.device = Some(Device { platform: Platform::AndroidTv, address: serial, label });
-                        self.summary = Some(summary);
+                        return self.load_info();
                     }
                     ConnectResult::NeedsApproval => {
                         self.log("The TV hasn't allowed debugging from this computer yet.");
@@ -354,6 +391,70 @@ impl App {
             }
             Message::Disconnect => self.disconnect(),
             Message::TabSelected(tab) => self.tab = tab,
+            Message::RefreshInfo => return self.load_info(),
+            Message::InfoLoaded(result) => {
+                self.info_loading = false;
+                match result {
+                    // Ignore a late answer from a TV we've since left.
+                    Ok(sections) if self.connection.is_some() => self.info = Some(sections),
+                    Ok(_) => {}
+                    Err(e) => self.log(format!("Could not read device info: {e}")),
+                }
+            }
+            Message::CopyInfo => {
+                if let Some(text) = self.info.as_deref().map(sysinfo::to_text) {
+                    self.log("Device info copied to the clipboard.");
+                    return iced::clipboard::write(text);
+                }
+            }
+            Message::RunHealthCheck => {
+                self.log("Running Health Check (read-only)…");
+                return self.run_health_check();
+            }
+            Message::HealthScanned(result) => {
+                if self.connection.is_none() {
+                    return Task::none();
+                }
+                self.health = match result {
+                    Ok(findings) => {
+                        let scanned_at = chrono::Local::now().format("%H:%M").to_string();
+                        Health::Done { findings, scanned_at }
+                    }
+                    Err(e) => {
+                        self.log(format!("Health Check failed: {e}"));
+                        Health::Failed(e)
+                    }
+                };
+            }
+            Message::FixPressed(fix) => match fix.confirmation() {
+                Some((title, question)) => {
+                    let dialog = rfd::AsyncMessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title(title)
+                        .set_description(question)
+                        .set_buttons(rfd::MessageButtons::YesNo);
+                    return Task::perform(dialog.show(), move |answer| {
+                        Message::FixConfirmed(fix.clone(), answer == rfd::MessageDialogResult::Yes)
+                    });
+                }
+                None => return self.update(Message::FixConfirmed(fix, true)),
+            },
+            Message::FixConfirmed(_, false) => {}
+            Message::FixConfirmed(fix, true) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.log(format!("{}…", fix.label()));
+                self.fixing = true;
+                return Task::perform(health::apply(conn, fix), Message::FixApplied);
+            }
+            Message::FixApplied(result) => {
+                self.fixing = false;
+                match result {
+                    Ok(line) => self.log(line),
+                    Err(e) => self.log(format!("Fix failed: {e}")),
+                }
+                // Show the effect straight away.
+                return self.run_health_check();
+            }
         }
         Task::none()
     }
@@ -500,8 +601,17 @@ impl App {
 
     fn tab_content(&self) -> Element<'_, Message> {
         let content: Element<'_, Message> = match self.tab {
-            Tab::Info => self.info_tab(),
-            other => empty_state(
+            Tab::Info => views::info(self.info.as_deref(), self.info_loading),
+            Tab::Performance => {
+                let state = match &self.health {
+                    Health::Idle => views::HealthState::Idle,
+                    Health::Scanning => views::HealthState::Scanning,
+                    Health::Failed(e) => views::HealthState::Failed(e),
+                    Health::Done { findings, scanned_at } => views::HealthState::Done { findings, scanned_at },
+                };
+                views::performance(state, self.fixing)
+            }
+            other => views::empty_state(
                 &format!("{} is being ported", other.name()),
                 "This tab arrives in a later milestone of the Rust rewrite.",
             ),
@@ -509,44 +619,6 @@ impl App {
         container(content).width(Fill).height(Fill).into()
     }
 
-    fn info_tab(&self) -> Element<'_, Message> {
-        let Some(s) = &self.summary else {
-            return empty_state(
-                "No TV connected",
-                "Pick a TV in the sidebar, or enter its IP address and press Connect.",
-            );
-        };
-        let or_dash = |v: &str| if v.is_empty() { "—".to_owned() } else { v.to_owned() };
-        let android = match (s.android_version.is_empty(), s.sdk.is_empty()) {
-            (false, false) => format!("{} (API {})", s.android_version, s.sdk),
-            _ => or_dash(&s.android_version),
-        };
-        let rows = [
-            ("Manufacturer", or_dash(&s.manufacturer)),
-            ("Model", or_dash(&s.model)),
-            ("Model Number", or_dash(&s.model_number)),
-            ("Android Version", android),
-            ("CPU ABI", or_dash(&s.abi)),
-        ];
-        let fields = column(rows.into_iter().map(|(label, value)| {
-            row![
-                text(format!("{label}:"))
-                    .size(13)
-                    .color(theme::TEXT_MUTED)
-                    .width(150)
-                    .align_x(iced::alignment::Horizontal::Right),
-                text(value).size(13).color(theme::TEXT),
-            ]
-            .spacing(12)
-            .into()
-        }))
-        .spacing(10);
-        let card = container(column![text("Device").size(12).color(theme::TEXT_MUTED), fields].spacing(10))
-            .padding(16)
-            .width(Fill)
-            .style(theme::panel);
-        scrollable(column![card].padding(4)).into()
-    }
 
     fn log_panel(&self) -> Element<'_, Message> {
         let lines = column(
@@ -570,15 +642,3 @@ impl App {
     }
 }
 
-fn empty_state<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
-    container(
-        column![
-            text(title.to_owned()).size(16).color(theme::TEXT),
-            text(subtitle.to_owned()).size(12).color(theme::TEXT_MUTED),
-        ]
-        .spacing(6)
-        .align_x(Alignment::Center),
-    )
-    .center(Fill)
-    .into()
-}

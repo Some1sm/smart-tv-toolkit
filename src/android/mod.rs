@@ -1,6 +1,7 @@
 //! Android TV / Google TV support, over ADB.
 
 pub mod health;
+pub mod packages;
 pub mod sysinfo;
 pub mod transport;
 

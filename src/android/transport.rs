@@ -84,6 +84,27 @@ impl Connection {
             Err(_) => Err(Error::Timeout),
         }
     }
+
+    /// Copy a file from the TV to `local`. A partial file is removed on failure.
+    pub async fn pull(&self, remote: String, local: PathBuf, timeout: Duration) -> Result<u64, Error> {
+        let device = self.device.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::create(&local).map_err(|e| Error::Adb(e.to_string()))?;
+            let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
+            let result = device.pull(&remote, &mut file).map_err(adb_error);
+            drop(file);
+            if result.is_err() {
+                let _ = std::fs::remove_file(&local);
+            }
+            result?;
+            Ok(std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0))
+        });
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(Error::Adb(join.to_string())),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
 }
 
 /// Connect to `host:port`, authorising with our key (created on first use).

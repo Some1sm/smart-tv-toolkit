@@ -20,6 +20,7 @@ use iced::widget::{button, column, container, row, rule, scrollable, space, text
 use iced::{Alignment, Element, Fill, Font, Length, Task, Theme};
 
 use android::health::{self, Finding, Fix};
+use android::packages::{self, Action, ListKind, Package};
 use android::sysinfo::{self, Section};
 use android::{ConnectResult, Connection};
 use devices::Reach;
@@ -101,6 +102,14 @@ struct App {
     info_loading: bool,
     health: Health,
     fixing: bool,
+    /// Android API level of the connected TV (gates per-app Clear Cache).
+    sdk: u32,
+    pkg_kind: Option<ListKind>,
+    packages: Vec<Package>,
+    pkg_filter: String,
+    pkg_selected: BTreeSet<String>,
+    pkg_loading: bool,
+    pkg_busy: bool,
     tab: Tab,
     log: Vec<String>,
 }
@@ -137,6 +146,17 @@ enum Message {
     FixPressed(Fix),
     FixConfirmed(Fix, bool),
     FixApplied(Result<String, String>),
+    ListPackages(ListKind),
+    PackagesLoaded(ListKind, Result<Vec<Package>, String>),
+    PackageFilter(String),
+    TogglePackage(String),
+    SelectShown,
+    ClearSelection,
+    PackageAction(Action),
+    PackageActionConfirmed(Action, Vec<String>, bool),
+    PackageActionDone(Vec<String>),
+    SaveApk,
+    SaveApkTo(Vec<String>, Option<PathBuf>),
 }
 
 impl App {
@@ -161,6 +181,13 @@ impl App {
             info_loading: false,
             health: Health::Idle,
             fixing: false,
+            sdk: 0,
+            pkg_kind: None,
+            packages: Vec::new(),
+            pkg_filter: String::new(),
+            pkg_selected: BTreeSet::new(),
+            pkg_loading: false,
+            pkg_busy: false,
             tab: Tab::Info,
             log: Vec::new(),
         };
@@ -232,7 +259,17 @@ impl App {
         self.connection = None;
         self.info = None;
         self.health = Health::Idle;
+        self.pkg_kind = None;
+        self.packages.clear();
+        self.pkg_selected.clear();
         self.tab = Tab::Info;
+    }
+
+    fn list_packages(&mut self, kind: ListKind) -> Task<Message> {
+        let Some(conn) = self.connection.clone() else { return Task::none() };
+        self.pkg_kind = Some(kind);
+        self.pkg_loading = true;
+        Task::perform(packages::list(conn, kind), move |r| Message::PackagesLoaded(kind, r))
     }
 
     fn load_info(&mut self) -> Task<Message> {
@@ -371,6 +408,7 @@ impl App {
                                 self.checked.insert(ip);
                             }
                         }
+                        self.sdk = summary.sdk.parse().unwrap_or(0);
                         self.connection = Some(connection);
                         self.device = Some(Device { platform: Platform::AndroidTv, address: serial, label });
                         return self.load_info();
@@ -452,8 +490,96 @@ impl App {
                     Ok(line) => self.log(line),
                     Err(e) => self.log(format!("Fix failed: {e}")),
                 }
-                // Show the effect straight away.
-                return self.run_health_check();
+                // Show the effect straight away, if a scan is on screen.
+                if !matches!(self.health, Health::Idle) {
+                    return self.run_health_check();
+                }
+            }
+            Message::ListPackages(kind) => {
+                self.log(format!("Listing {} packages…", kind.label().to_lowercase()));
+                return self.list_packages(kind);
+            }
+            Message::PackagesLoaded(kind, result) => {
+                if self.pkg_kind != Some(kind) {
+                    return Task::none(); // a newer list was requested meanwhile
+                }
+                self.pkg_loading = false;
+                match result {
+                    Ok(list) if self.connection.is_some() => {
+                        self.log(format!("{} {} package(s).", list.len(), kind.label()));
+                        let ids: BTreeSet<&String> = list.iter().map(|p| &p.id).collect();
+                        self.pkg_selected.retain(|p| ids.contains(p));
+                        self.packages = list;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.log(format!("Could not list packages: {e}")),
+                }
+            }
+            Message::PackageFilter(filter) => self.pkg_filter = filter,
+            Message::TogglePackage(pkg) => {
+                if !self.pkg_selected.remove(&pkg) {
+                    self.pkg_selected.insert(pkg);
+                }
+            }
+            Message::SelectShown => {
+                let shown: Vec<String> = views::visible(&self.packages, &self.pkg_filter).map(|p| p.id.clone()).collect();
+                self.pkg_selected.extend(shown);
+            }
+            Message::ClearSelection => self.pkg_selected.clear(),
+            Message::PackageAction(action) => {
+                let pkgs: Vec<String> = self.pkg_selected.iter().cloned().collect();
+                match action.confirmation(&pkgs) {
+                    Some((title, question)) => {
+                        let dialog = rfd::AsyncMessageDialog::new()
+                            .set_level(rfd::MessageLevel::Warning)
+                            .set_title(title)
+                            .set_description(question)
+                            .set_buttons(rfd::MessageButtons::YesNo);
+                        return Task::perform(dialog.show(), move |answer| {
+                            Message::PackageActionConfirmed(action, pkgs.clone(), answer == rfd::MessageDialogResult::Yes)
+                        });
+                    }
+                    None => return self.update(Message::PackageActionConfirmed(action, pkgs, true)),
+                }
+            }
+            Message::PackageActionConfirmed(_, _, false) => {}
+            Message::PackageActionConfirmed(action, pkgs, true) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.pkg_busy = true;
+                return Task::perform(packages::run(conn, action, pkgs), Message::PackageActionDone);
+            }
+            Message::PackageActionDone(lines) => {
+                self.pkg_busy = false;
+                for line in lines {
+                    self.log(line);
+                }
+                // Reload so uninstalled/disabled state shows.
+                if let Some(kind) = self.pkg_kind {
+                    return self.list_packages(kind);
+                }
+            }
+            Message::SaveApk => {
+                let pkgs: Vec<String> = self.pkg_selected.iter().cloned().collect();
+                let title = match pkgs.as_slice() {
+                    [one] => format!("Save APK for {one}: choose a folder"),
+                    many => format!("Save APKs for {} packages: choose a folder", many.len()),
+                };
+                return Task::perform(
+                    async move {
+                        let dir = rfd::AsyncFileDialog::new().set_title(title).pick_folder().await;
+                        (pkgs, dir.map(|d| d.path().to_path_buf()))
+                    },
+                    |(pkgs, dir)| Message::SaveApkTo(pkgs, dir),
+                );
+            }
+            Message::SaveApkTo(_, None) => {}
+            Message::SaveApkTo(pkgs, Some(dir)) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.log(format!("Saving {} APK(s) to {}…", pkgs.len(), dir.display()));
+                self.pkg_busy = true;
+                return Task::perform(packages::save_apks(conn, pkgs, dir), |lines| {
+                    Message::PackageActionDone(lines)
+                });
             }
         }
         Task::none()
@@ -611,6 +737,15 @@ impl App {
                 };
                 views::performance(state, self.fixing)
             }
+            Tab::Packages => views::packages(views::PackagesView {
+                kind: self.pkg_kind,
+                packages: &self.packages,
+                filter: &self.pkg_filter,
+                selected: &self.pkg_selected,
+                loading: self.pkg_loading,
+                busy: self.pkg_busy,
+                sdk: self.sdk,
+            }),
             other => views::empty_state(
                 &format!("{} is being ported", other.name()),
                 "This tab arrives in a later milestone of the Rust rewrite.",

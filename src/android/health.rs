@@ -187,8 +187,15 @@ pub enum Fix {
     Stop(String),
     Disable(String),
     Uninstall(String),
-    SpeedUpAnimations,
+    /// Window, transition and animator scale: "0.5", "0" (off) or "1".
+    Animations(&'static str),
     EnableFreezer,
+    /// Ahead-of-time compile every app with its usage profile.
+    CompileApps,
+    /// App freezer plus compiling.
+    AllOptimizations,
+    /// Stop cached background processes (`am kill-all`).
+    KillBackground,
 }
 
 impl Fix {
@@ -198,8 +205,13 @@ impl Fix {
             Fix::Stop(_) => "Stop",
             Fix::Disable(_) => "Disable",
             Fix::Uninstall(_) => "Uninstall",
-            Fix::SpeedUpAnimations => "Speed Up Animations (0.5×)",
+            Fix::Animations("0") => "Disable Animations",
+            Fix::Animations("1") => "Reset Animations (1×)",
+            Fix::Animations(_) => "Speed Up Animations (0.5×)",
             Fix::EnableFreezer => "Enable App Freezer",
+            Fix::CompileApps => "Compile Apps for Speed",
+            Fix::AllOptimizations => "Run All Optimizations",
+            Fix::KillBackground => "Kill Background Apps",
         }
     }
 
@@ -223,7 +235,21 @@ impl Fix {
                 format!("Disable {}?\n\nYou can turn it back on any time from Packages → Enable.", name(p)),
             )),
             Fix::Uninstall(p) => Some(("Uninstall App".into(), format!("Uninstall {}?\n\nThis removes the app and its data.", name(p)))),
-            Fix::SpeedUpAnimations | Fix::EnableFreezer => None,
+            Fix::CompileApps | Fix::AllOptimizations => Some((
+                self.label().into(),
+                "Compile every app ahead of time for faster launches?
+
+This takes several minutes and                  the TV may be slow meanwhile. Needs free storage space to work well."
+                    .into(),
+            )),
+            Fix::KillBackground => Some((
+                "Kill Background Apps".into(),
+                "Stop all cached background apps?
+
+They restart when opened. Frees memory for a while;                  Android refills the cache as you use the TV."
+                    .into(),
+            )),
+            Fix::Animations(_) | Fix::EnableFreezer => None,
         }
     }
 }
@@ -382,7 +408,7 @@ pub fn findings(sec: &HashMap<String, String>) -> Vec<Finding> {
         let freezer_ok = settings.get("cached_apps_freezer").is_some_and(|v| v == "enabled");
         let mut fixes = vec![];
         if !anim_ok {
-            fixes.push(Fix::SpeedUpAnimations);
+            fixes.push(Fix::Animations("0.5"));
         }
         if !freezer_ok {
             fixes.push(Fix::EnableFreezer);
@@ -406,6 +432,21 @@ pub fn findings(sec: &HashMap<String, String>) -> Vec<Finding> {
 pub async fn scan(conn: Connection) -> Result<Vec<Finding>, String> {
     let raw = conn.shell(SCRIPT, Duration::from_secs(90)).await.map_err(|e| e.to_string())?;
     Ok(findings(&split_sections(&raw)))
+}
+
+const FREEZER_ON: &str = "settings put global cached_apps_freezer enabled";
+const COMPILE: &str = "cmd package compile -m speed-profile -a";
+
+/// Summarise `cmd package compile -a`, which prints a result per package.
+fn compile(out: String) -> Result<String, String> {
+    let (ok, failed) = (out.matches("Success").count(), out.matches("Failure").count());
+    Ok(if ok + failed > 0 {
+        format!("Compiled apps: {ok} succeeded, {failed} failed.")
+    } else if out.is_empty() {
+        "Compile finished.".into()
+    } else {
+        format!("Compile: {}", out.lines().last().unwrap_or(""))
+    })
 }
 
 async fn data_free(conn: &Connection) -> Option<u64> {
@@ -436,11 +477,17 @@ pub async fn apply(conn: Connection, fix: Fix) -> Result<String, String> {
         Fix::Stop(p) => run(format!("am force-stop {p}"), 30).await?,
         Fix::Disable(p) => run(format!("pm disable-user --user 0 {p}"), 30).await?,
         Fix::Uninstall(p) => run(format!("pm uninstall --user 0 {p}"), 60).await?,
-        Fix::SpeedUpAnimations => {
-            let cmds: Vec<String> = ANIMATION_KEYS.iter().map(|k| format!("settings put global {k} 0.5")).collect();
+        Fix::Animations(scale) => {
+            let cmds: Vec<String> = ANIMATION_KEYS.iter().map(|k| format!("settings put global {k} {scale}")).collect();
             run(cmds.join("; "), 30).await?
         }
-        Fix::EnableFreezer => run("settings put global cached_apps_freezer enabled".into(), 30).await?,
+        Fix::EnableFreezer => run(FREEZER_ON.into(), 30).await?,
+        Fix::CompileApps => return compile(run(COMPILE.into(), 1800).await?),
+        Fix::AllOptimizations => {
+            run(FREEZER_ON.into(), 30).await?;
+            return compile(run(COMPILE.into(), 1800).await?).map(|c| format!("App freezer on. {c}"));
+        }
+        Fix::KillBackground => run("am kill-all".into(), 30).await?,
     };
     Ok(if out.is_empty() { format!("{}: done.", fix.label()) } else { format!("{}: {out}", fix.label()) })
 }
@@ -606,7 +653,7 @@ Cache Sizes: [2200000000,500000]
     #[test]
     fn quick_tweaks_treat_null_as_default_speed() {
         let f = &by_title()["Quick Tweaks"];
-        assert_eq!(f.fixes, [Fix::SpeedUpAnimations]);
+        assert_eq!(f.fixes, [Fix::Animations("0.5")]);
         assert!(f.detail.contains("App freezer: on."));
     }
 

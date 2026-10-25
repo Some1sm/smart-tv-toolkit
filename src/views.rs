@@ -7,7 +7,9 @@ use iced::widget::{button, column, container, progress_bar, row, scrollable, spa
 use iced::{Alignment, Element, Fill, Font};
 
 use crate::Message;
+use crate::android::actions::{self, Action as TvAction, Current};
 use crate::android::catalog::{self, AppSpec, SHIZUKU};
+use crate::android::files::Entry;
 use crate::android::health::{Finding, Fix, Severity};
 use crate::android::packages::{self, Action, ListKind, Package};
 use crate::android::sysinfo::Section;
@@ -576,4 +578,263 @@ mod tests {
         assert_eq!(tv(press(Key::Named(key::Named::ArrowUp), true)), None);
         assert_eq!(tv(press(Key::Character("x".into()), false)), None);
     }
+}
+
+// ── Settings ─────────────────────────────────────────────────────────────────
+
+fn act(label: &str, action: TvAction, busy: bool) -> Element<'_, Message> {
+    let style: fn(&iced::Theme, button::Status) -> button::Style =
+        if action.confirmation().is_some() { theme::danger_button } else { theme::secondary_button };
+    button(text(label).size(12))
+        .padding([6, 12])
+        .style(style)
+        .on_press_maybe((!busy).then_some(Message::TvAction(action)))
+        .into()
+}
+
+fn current_value(value: Option<&str>) -> Element<'_, Message> {
+    text(format!("Now: {}", value.unwrap_or("…"))).size(12).color(theme::TEXT_MUTED).width(170).into()
+}
+
+fn setting_row<'a>(label: &'a str, now: Option<&'a str>, controls: Element<'a, Message>) -> Element<'a, Message> {
+    row![
+        text(label).size(13).color(theme::TEXT).width(150),
+        current_value(now),
+        controls,
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+pub fn settings<'a>(current: Option<&'a Current>, density: &'a str, busy: bool) -> Element<'a, Message> {
+    let now = |f: fn(&Current) -> &String| current.map(|c| f(c).as_str());
+    let rotation_labels: Vec<&'static str> = actions::ROTATIONS.iter().map(|(l, _)| *l).collect();
+    let timeout_labels: Vec<&'static str> = actions::TIMEOUTS.iter().map(|(l, _)| *l).collect();
+    let pick_rotation = iced::widget::pick_list(rotation_labels, None::<&'static str>, |label| {
+        let v = actions::ROTATIONS.iter().find(|(l, _)| *l == label).map(|(_, v)| *v).unwrap_or("0");
+        Message::TvAction(TvAction::Rotation(v))
+    })
+    .placeholder("Change…")
+    .text_size(12)
+    .width(200);
+    let pick_timeout = iced::widget::pick_list(timeout_labels, None::<&'static str>, |label| {
+        let v = actions::TIMEOUTS.iter().find(|(l, _)| *l == label).map(|(_, v)| *v).unwrap_or("600000");
+        Message::TvAction(TvAction::ScreenTimeout(v))
+    })
+    .placeholder("Change…")
+    .text_size(12)
+    .width(200);
+    let density_controls = row![
+        text_input("e.g. 320", density).on_input(Message::DensityInput).on_submit(Message::ApplyDensity).size(12).width(90),
+        button(text("Apply").size(12)).padding([6, 12]).style(theme::secondary_button)
+            .on_press_maybe((!busy).then_some(Message::ApplyDensity)),
+        act("Reset", TvAction::ResetDensity, busy),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let pair = |on: TvAction, off: TvAction| -> Element<'a, Message> {
+        row![act("Turn on", on, busy), act("Turn off", off, busy)].spacing(6).into()
+    };
+
+    let display = card(
+        "Display",
+        column![
+            setting_row("Rotation", now(|c| &c.rotation), pick_rotation.into()),
+            setting_row("Screen timeout", now(|c| &c.timeout), pick_timeout.into()),
+            setting_row("Density", now(|c| &c.density), density_controls.into()),
+        ]
+        .spacing(10)
+        .into(),
+    );
+    let system = card(
+        "System",
+        column![
+            setting_row("Developer options", now(|c| &c.developer_options),
+                        row![act("Show", TvAction::DeveloperOptions(true), busy), act("Hide", TvAction::DeveloperOptions(false), busy)].spacing(6).into()),
+            setting_row("Location", now(|c| &c.location), pair(TvAction::Location(true), TvAction::Location(false))),
+            setting_row("Play Protect", now(|c| &c.play_protect), pair(TvAction::PlayProtect(true), TvAction::PlayProtect(false))),
+            setting_row("Ambient display", now(|c| &c.ambient), pair(TvAction::AmbientDisplay(true), TvAction::AmbientDisplay(false))),
+            setting_row("Time server", now(|c| &c.ntp), act("Use pool.ntp.org", TvAction::RepairNtp, busy)),
+        ]
+        .spacing(10)
+        .into(),
+    );
+    let refresh = button(text("Refresh").size(12)).padding([6, 12]).style(theme::tab_button(false)).on_press(Message::LoadSettings);
+    scrollable(column![display, system, refresh].spacing(8).padding(4)).into()
+}
+
+// ── Tools ────────────────────────────────────────────────────────────────────
+
+pub struct ToolsView<'a> {
+    pub launch: &'a str,
+    pub text: &'a str,
+    pub console: &'a str,
+    pub busy: bool,
+}
+
+pub fn tools<'a>(v: ToolsView<'a>) -> Element<'a, Message> {
+    let busy = v.busy;
+    let col = |items: Vec<Element<'static, Message>>| column(items).spacing(6).width(Fill);
+    let power = card(
+        "Power",
+        col(vec![
+            act("Wake", TvAction::Wake, busy),
+            act("Sleep / stand-by", TvAction::Sleep, busy),
+            act("Reboot", TvAction::Reboot, busy),
+            act("Reboot to recovery", TvAction::RebootRecovery, busy),
+        ])
+        .into(),
+    );
+    let navigation = card(
+        "Navigation",
+        col(vec![
+            act("Open notifications", TvAction::Notifications, busy),
+            act("Google search (weather)", TvAction::SearchWeather, busy),
+            act("System updates", TvAction::SystemUpdates, busy),
+        ])
+        .into(),
+    );
+    let shortcuts = card(
+        "Open on the TV",
+        col(actions::SETTINGS_SHORTCUTS.iter().map(|(label, a)| act(label, TvAction::OpenSettings(a), busy)).collect())
+            .into(),
+    );
+
+    let input_row = |placeholder: &'a str, value: &'a str, on_input: fn(String) -> Message, submit: Message, label: &'a str| -> Element<'a, Message> {
+        row![
+            text_input(placeholder, value).on_input(on_input).on_submit(submit.clone()).size(13),
+            button(text(label).size(12)).padding([6, 14]).style(theme::secondary_button)
+                .on_press_maybe((!busy && !value.trim().is_empty()).then_some(submit)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let inputs = card(
+        "Apps, Text & Console",
+        column![
+            text("Launch an app by package name").size(12).color(theme::TEXT_MUTED),
+            input_row("com.example.app", v.launch, Message::LaunchInput, Message::LaunchSubmit, "Launch"),
+            text("Type text on the TV (into the focused field)").size(12).color(theme::TEXT_MUTED),
+            input_row("Text to send…", v.text, Message::SendTextInput, Message::SendTextSubmit, "Send"),
+            text("Shell command (an 'adb shell' prefix is fine); output goes to the log").size(12).color(theme::TEXT_MUTED),
+            input_row("input keyevent 3", v.console, Message::ConsoleInput, Message::ConsoleSubmit, "Run"),
+        ]
+        .spacing(6)
+        .into(),
+    );
+    scrollable(column![row![power, navigation, shortcuts].spacing(8), inputs].spacing(8).padding(4)).into()
+}
+
+// ── Media ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recording {
+    Idle,
+    Recording,
+    Stopping,
+}
+
+pub struct MediaView<'a> {
+    pub recording: Recording,
+    pub scrcpy_found: bool,
+    pub cwd: &'a str,
+    pub path_input: &'a str,
+    pub entries: Option<&'a Result<Vec<Entry>, String>>,
+    pub selected: Option<&'a str>,
+    pub busy: bool,
+}
+
+pub fn media(v: MediaView<'_>) -> Element<'_, Message> {
+    let scrcpy = card(
+        "scrcpy: mirror and control the TV",
+        column![
+            text(if v.scrcpy_found {
+                "scrcpy shows the TV's screen in a window on your computer, with mouse and keyboard control."
+            } else {
+                "scrcpy wasn't found. Download it, then put it next to this app or on your PATH."
+            })
+            .size(12)
+            .color(theme::TEXT_MUTED),
+            row![
+                small_button("Launch scrcpy", theme::primary_button, v.scrcpy_found.then_some(Message::LaunchScrcpy)),
+                small_button("Download scrcpy", theme::secondary_button,
+                             Some(Message::OpenUrl("https://github.com/Genymobile/scrcpy/releases/latest"))),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
+    let (status, color) = match v.recording {
+        Recording::Idle => ("Not recording. Recordings stop by themselves after 3 minutes.", theme::TEXT_DISABLED),
+        Recording::Recording => ("● Recording…", theme::DANGER),
+        Recording::Stopping => ("Finishing the file…", theme::WARNING),
+    };
+    let recording = card(
+        "Screen Recording",
+        column![
+            text(status).size(12).color(color),
+            row![
+                small_button("Start Recording", theme::primary_button,
+                             (v.recording == Recording::Idle).then_some(Message::RecordStart)),
+                small_button("Stop & Save", theme::danger_button,
+                             (v.recording == Recording::Recording).then_some(Message::RecordStop)),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
+    let nav = row![
+        text_input("/sdcard/", v.path_input).on_input(Message::FilesPathInput).on_submit(Message::FilesGo).size(12),
+        small_button("Go", theme::secondary_button, Some(Message::FilesGo)),
+        small_button("Up", theme::secondary_button, (v.cwd != "/").then_some(Message::FilesUp)),
+        small_button("↻", theme::secondary_button, Some(Message::FilesRefresh)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let listing: Element<'_, Message> = match v.entries {
+        None => text("Loading…").size(12).color(theme::TEXT_MUTED).into(),
+        Some(Err(e)) => text(e.as_str()).size(12).color(theme::DANGER).into(),
+        Some(Ok(list)) if list.is_empty() => text("(empty folder)").size(12).color(theme::TEXT_DISABLED).into(),
+        Some(Ok(list)) => column(list.iter().map(|e| {
+            let full = format!("{}{}", v.cwd, e.name);
+            let selected = v.selected == Some(full.as_str());
+            let label = if e.is_dir { format!("📁 {}/", e.name) } else { e.name.clone() };
+            button(text(label).size(12).color(if e.is_dir { theme::PRIMARY } else { theme::TEXT }))
+                .padding([3, 10])
+                .width(Fill)
+                .style(theme::tab_button(selected))
+                .on_press(Message::FileClicked(e.name.clone(), e.is_dir))
+                .into()
+        }))
+        .spacing(1)
+        .into(),
+    };
+    let target = v.selected.unwrap_or(v.cwd);
+    let files = card(
+        "Files on the TV",
+        column![
+            nav,
+            container(scrollable(listing).height(260)).padding(6).width(Fill).style(theme::log_box),
+            text(format!("Selected: {target}  (click a file to select it; with nothing selected, the whole folder)"))
+                .size(11)
+                .color(theme::TEXT_MUTED),
+            row![
+                small_button("Download to PC…", theme::primary_button, (!v.busy).then_some(Message::FilesDownload)),
+                small_button("Send file here…", theme::secondary_button, (!v.busy).then_some(Message::FilesSend)),
+                text(if v.busy { "Working…" } else { "" }).size(12).color(theme::WARNING),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
+    scrollable(column![scrcpy, recording, files].spacing(8).padding(4)).into()
 }

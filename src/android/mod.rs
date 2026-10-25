@@ -1,8 +1,11 @@
 //! Android TV / Google TV support, over ADB.
 
+pub mod actions;
 pub mod catalog;
+pub mod files;
 pub mod health;
 pub mod install;
+pub mod media;
 pub mod packages;
 pub mod remote;
 pub mod shizuku;

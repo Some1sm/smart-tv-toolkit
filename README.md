@@ -53,7 +53,8 @@ or **x64 Native Tools** prompt so the MSVC environment is set.
 2. Devices: network scan ✅, mDNS discovery ✅, device history ✅ (imports the original's
    `devices.json`), wireless pairing
 3. Info tab and Health Check ✅
-4. Packages ✅, Performance ✅, Install ✅, Remote ✅, Screenshot ✅, Settings, Tools, Media, Files
+4. Packages ✅, Performance ✅, Install ✅, Remote ✅, Screenshot ✅, Settings ✅, Tools ✅,
+   Media (scrcpy, screen recording, file browser) ✅
 5. Packaging: single executable, automated builds for Windows and macOS
 
 ## License

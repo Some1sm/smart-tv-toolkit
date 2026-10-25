@@ -21,7 +21,7 @@ use iced::{Alignment, Element, Fill, Font, Length, Task, Theme};
 
 use android::health::{self, Finding, Fix};
 use android::packages::{self, Action, ListKind, Package};
-use android::{catalog, install, remote, shizuku};
+use android::{actions, catalog, files, install, media, remote, shizuku};
 use android::sysinfo::{self, Section};
 use android::{ConnectResult, Connection};
 use devices::Reach;
@@ -120,6 +120,18 @@ struct App {
     screenshot: Option<(iced::widget::image::Handle, Vec<u8>)>,
     screenshot_status: String,
     capturing: bool,
+    settings_now: Option<actions::Current>,
+    density_input: String,
+    tv_busy: bool,
+    launch_input: String,
+    text_input: String,
+    console_input: String,
+    recording: views::Recording,
+    files_cwd: String,
+    files_path_input: String,
+    files_entries: Option<Result<Vec<files::Entry>, String>>,
+    files_selected: Option<String>,
+    files_busy: bool,
     tab: Tab,
     log: Vec<String>,
 }
@@ -184,6 +196,37 @@ enum Message {
     ScreenshotTaken(Result<Vec<u8>, String>),
     SaveScreenshot,
     ScreenshotSaveTo(Option<PathBuf>),
+    TvAction(actions::Action),
+    TvActionConfirmed(actions::Action, bool),
+    TvActionDone(actions::Action, Result<String, String>),
+    LoadSettings,
+    SettingsLoaded(Result<actions::Current, String>),
+    DensityInput(String),
+    ApplyDensity,
+    LaunchInput(String),
+    LaunchSubmit,
+    SendTextInput(String),
+    SendTextSubmit,
+    ConsoleInput(String),
+    ConsoleSubmit,
+    LaunchScrcpy,
+    RecordStart,
+    RecordStop,
+    RecordEnded(Result<(), String>),
+    RecordSaveTo(Option<PathBuf>),
+    RecordSaved(Result<String, String>),
+    FilesPathInput(String),
+    FilesGo,
+    FilesUp,
+    FilesRefresh,
+    FilesListed(String, Result<Vec<files::Entry>, String>),
+    FileClicked(String, bool),
+    FilesDownload,
+    FilesDownloadTo(Option<PathBuf>),
+    FilesSend,
+    FilesSendFile(Option<PathBuf>),
+    FilesDone(Vec<String>),
+    Ignore,
 }
 
 impl App {
@@ -221,6 +264,18 @@ impl App {
             screenshot: None,
             screenshot_status: String::new(),
             capturing: false,
+            settings_now: None,
+            density_input: String::new(),
+            tv_busy: false,
+            launch_input: String::new(),
+            text_input: String::new(),
+            console_input: String::new(),
+            recording: views::Recording::Idle,
+            files_cwd: "/sdcard/".into(),
+            files_path_input: "/sdcard/".into(),
+            files_entries: None,
+            files_selected: None,
+            files_busy: false,
             tab: Tab::Info,
             log: Vec::new(),
         };
@@ -305,7 +360,26 @@ impl App {
         self.pkg_kind = None;
         self.packages.clear();
         self.pkg_selected.clear();
+        self.settings_now = None;
+        self.files_entries = None;
+        self.files_selected = None;
+        self.recording = views::Recording::Idle;
         self.tab = Tab::Info;
+    }
+
+    fn load_settings(&mut self) -> Task<Message> {
+        let Some(conn) = self.connection.clone() else { return Task::none() };
+        Task::perform(actions::read_current(conn), Message::SettingsLoaded)
+    }
+
+    fn list_files(&mut self, dir: String) -> Task<Message> {
+        let Some(conn) = self.connection.clone() else { return Task::none() };
+        let dir = files::as_dir(&dir);
+        self.files_cwd = dir.clone();
+        self.files_path_input = dir.clone();
+        self.files_entries = None;
+        self.files_selected = None;
+        Task::perform(files::list(conn, dir.clone()), move |r| Message::FilesListed(dir.clone(), r))
     }
 
     fn list_packages(&mut self, kind: ListKind) -> Task<Message> {
@@ -472,7 +546,15 @@ impl App {
                 }
             }
             Message::Disconnect => self.disconnect(),
-            Message::TabSelected(tab) => self.tab = tab,
+            Message::TabSelected(tab) => {
+                self.tab = tab;
+                // Show live values whenever these tabs are opened.
+                match tab {
+                    Tab::Settings => return self.load_settings(),
+                    Tab::Media if self.files_entries.is_none() => return self.list_files(self.files_cwd.clone()),
+                    _ => {}
+                }
+            }
             Message::RefreshInfo => return self.load_info(),
             Message::InfoLoaded(result) => {
                 self.info_loading = false;
@@ -763,6 +845,178 @@ impl App {
                     });
                 }
             }
+            Message::Ignore => {}
+            // ── Settings & Tools ──
+            Message::TvAction(action) => match action.confirmation() {
+                Some((title, question)) => {
+                    let dialog = rfd::AsyncMessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title(title)
+                        .set_description(question)
+                        .set_buttons(rfd::MessageButtons::YesNo);
+                    return Task::perform(dialog.show(), move |answer| {
+                        Message::TvActionConfirmed(action.clone(), answer == rfd::MessageDialogResult::Yes)
+                    });
+                }
+                None => return self.update(Message::TvActionConfirmed(action, true)),
+            },
+            Message::TvActionConfirmed(_, false) => {}
+            Message::TvActionConfirmed(action, true) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                if let actions::Action::Console(cmd) = &action {
+                    self.log(format!("$ {}", actions::console_command(cmd)));
+                }
+                self.tv_busy = true;
+                return Task::perform(actions::run(conn, action.clone()), move |r| Message::TvActionDone(action.clone(), r));
+            }
+            Message::TvActionDone(action, result) => {
+                self.tv_busy = false;
+                match result {
+                    Ok(out) => self.log(out),
+                    Err(e) => self.log(format!("Failed: {e}")),
+                }
+                if action.is_reboot() {
+                    self.disconnect();
+                } else if self.tab == Tab::Settings {
+                    return self.load_settings();
+                }
+            }
+            Message::LoadSettings => return self.load_settings(),
+            Message::SettingsLoaded(result) => match result {
+                Ok(now) if self.connection.is_some() => self.settings_now = Some(now),
+                Ok(_) => {}
+                Err(e) => self.log(format!("Could not read settings: {e}")),
+            },
+            Message::DensityInput(v) => self.density_input = v,
+            Message::ApplyDensity => match self.density_input.trim().parse::<u32>() {
+                Ok(d) if (120..=640).contains(&d) => return self.update(Message::TvAction(actions::Action::Density(d))),
+                _ => self.log("Enter a density between 120 and 640 (TVs usually use 213, 240 or 320)."),
+            },
+            Message::LaunchInput(v) => self.launch_input = v,
+            Message::LaunchSubmit => {
+                let pkg = self.launch_input.trim().to_owned();
+                if !pkg.is_empty() {
+                    return self.update(Message::TvAction(actions::Action::LaunchApp(pkg)));
+                }
+            }
+            Message::SendTextInput(v) => self.text_input = v,
+            Message::SendTextSubmit => {
+                let text = std::mem::take(&mut self.text_input);
+                if !text.is_empty() {
+                    return self.update(Message::TvAction(actions::Action::SendText(text)));
+                }
+            }
+            Message::ConsoleInput(v) => self.console_input = v,
+            Message::ConsoleSubmit => {
+                let cmd = std::mem::take(&mut self.console_input);
+                if !cmd.trim().is_empty() {
+                    return self.update(Message::TvAction(actions::Action::Console(cmd)));
+                }
+            }
+            // ── Media ──
+            Message::LaunchScrcpy => {
+                if let Some(device) = &self.device {
+                    let line = media::launch_scrcpy(&device.address).unwrap_or_else(|e| e);
+                    self.log(line);
+                }
+            }
+            Message::RecordStart => {
+                let Some(address) = self.device.as_ref().map(|d| d.address.clone()) else { return Task::none() };
+                self.recording = views::Recording::Recording;
+                self.log("Recording the screen…");
+                return Task::perform(media::record(address), Message::RecordEnded);
+            }
+            Message::RecordStop => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.recording = views::Recording::Stopping;
+                return Task::perform(media::stop(conn), |_| Message::Ignore);
+            }
+            Message::RecordEnded(result) => {
+                self.recording = views::Recording::Stopping;
+                if let Err(e) = result {
+                    self.log(format!("Recording failed: {}", e.replace('\n', " ")));
+                    return self.update(Message::RecordSaveTo(None));
+                }
+                let name = format!("recording-{}.mp4", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Save recording")
+                            .set_file_name(name)
+                            .add_filter("MP4 video", &["mp4"])
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::RecordSaveTo,
+                );
+            }
+            Message::RecordSaveTo(dest) => {
+                let Some(conn) = self.connection.clone() else {
+                    self.recording = views::Recording::Idle;
+                    return Task::none();
+                };
+                return Task::perform(media::save_recording(conn, dest), Message::RecordSaved);
+            }
+            Message::RecordSaved(result) => {
+                self.recording = views::Recording::Idle;
+                self.log(result.unwrap_or_else(|e| format!("Could not save the recording: {e}")));
+            }
+            Message::FilesPathInput(v) => self.files_path_input = v,
+            Message::FilesGo => return self.list_files(self.files_path_input.clone()),
+            Message::FilesUp => return self.list_files(files::parent(&self.files_cwd)),
+            Message::FilesRefresh => return self.list_files(self.files_cwd.clone()),
+            Message::FilesListed(dir, result) => {
+                if dir == self.files_cwd && self.connection.is_some() {
+                    self.files_entries = Some(result);
+                }
+            }
+            Message::FileClicked(name, true) => return self.list_files(format!("{}{name}", self.files_cwd)),
+            Message::FileClicked(name, false) => {
+                let full = format!("{}{name}", self.files_cwd);
+                // Clicking the selected file again deselects it (back to the folder).
+                self.files_selected = if self.files_selected.as_deref() == Some(full.as_str()) { None } else { Some(full) };
+            }
+            Message::FilesDownload => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new().set_title("Download to folder").pick_folder().await.map(|d| d.path().to_path_buf())
+                    },
+                    Message::FilesDownloadTo,
+                );
+            }
+            Message::FilesDownloadTo(None) => {}
+            Message::FilesDownloadTo(Some(dest)) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                let target = self.files_selected.clone().unwrap_or_else(|| self.files_cwd.clone());
+                self.log(format!("Downloading {target}…"));
+                self.files_busy = true;
+                return Task::perform(files::download(conn, target, dest), Message::FilesDone);
+            }
+            Message::FilesSend => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new().set_title("Send a file to the TV").pick_file().await.map(|f| f.path().to_path_buf())
+                    },
+                    Message::FilesSendFile,
+                );
+            }
+            Message::FilesSendFile(None) => {}
+            Message::FilesSendFile(Some(local)) => {
+                let Some(conn) = self.connection.clone() else { return Task::none() };
+                self.files_busy = true;
+                let dir = self.files_cwd.clone();
+                return Task::perform(files::send(conn, local, dir), |r| {
+                    Message::FilesDone(vec![r.unwrap_or_else(|e| format!("Send failed: {e}"))])
+                });
+            }
+            Message::FilesDone(lines) => {
+                self.files_busy = false;
+                for line in lines {
+                    self.log(line);
+                }
+                return self.list_files(self.files_cwd.clone());
+            }
         }
         Task::none()
     }
@@ -920,6 +1174,22 @@ impl App {
                 views::performance(state, self.fixing)
             }
             Tab::Remote => views::remote(),
+            Tab::Settings => views::settings(self.settings_now.as_ref(), &self.density_input, self.tv_busy),
+            Tab::Tools => views::tools(views::ToolsView {
+                launch: &self.launch_input,
+                text: &self.text_input,
+                console: &self.console_input,
+                busy: self.tv_busy,
+            }),
+            Tab::Media => views::media(views::MediaView {
+                recording: self.recording,
+                scrcpy_found: media::find_scrcpy().is_some(),
+                cwd: &self.files_cwd,
+                path_input: &self.files_path_input,
+                entries: self.files_entries.as_ref(),
+                selected: self.files_selected.as_deref(),
+                busy: self.files_busy,
+            }),
             Tab::Screenshot => {
                 views::screenshot(self.screenshot.as_ref().map(|(h, _)| h), &self.screenshot_status, self.capturing)
             }
@@ -937,10 +1207,6 @@ impl App {
                 busy: self.pkg_busy,
                 sdk: self.sdk,
             }),
-            other => views::empty_state(
-                &format!("{} is being ported", other.name()),
-                "This tab arrives in a later milestone of the Rust rewrite.",
-            ),
         };
         container(content).width(Fill).height(Fill).into()
     }

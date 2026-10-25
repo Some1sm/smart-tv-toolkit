@@ -1,0 +1,13 @@
+[package]
+name = "smart-tv-toolkit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "7"
+iced = { version = "0.14", features = ["tokio"] }
+open = "5"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "macros", "rt"] }

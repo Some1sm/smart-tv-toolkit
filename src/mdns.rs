@@ -30,6 +30,8 @@ pub struct MdnsDevice {
     pub android_tv: bool,
     pub adb_port: Option<u16>,
     pub wireless_debugging: bool,
+    /// Android 11+ wireless debugging's connect port (used after pairing).
+    pub tls_port: Option<u16>,
 }
 
 impl MdnsDevice {
@@ -62,7 +64,10 @@ fn record(found: &mut HashMap<Ipv4Addr, MdnsDevice>, ip: Ipv4Addr, kind: &str, i
             }
         }
         ADB => d.adb_port = Some(port),
-        ADB_TLS => d.wireless_debugging = true,
+        ADB_TLS => {
+            d.wireless_debugging = true;
+            d.tls_port = Some(port);
+        }
         _ => {}
     }
 }

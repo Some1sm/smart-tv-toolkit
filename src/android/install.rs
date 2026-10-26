@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{Connection, transport};
+use crate::jobs::{Progress, Unit};
 
 /// Play Protect settings that can block or prompt during sideloading.
 const VERIFIER_KEYS: [&str; 2] = ["package_verifier_enable", "package_verifier_user_consent"];
@@ -35,21 +36,23 @@ async fn restore_verifier(conn: &Connection, previous: Vec<(&'static str, String
         let cmd = if value.is_empty() || value == "null" {
             format!("settings delete global {key}")
         } else {
-            format!("settings put global {key} {value}")
+            format!("settings put global {key} {}", super::shell_quote(&value))
         };
         let _ = sh(conn, &cmd, 10).await;
     }
 }
 
 /// Install one APK while the verifier is already relaxed.
-async fn install_one(conn: &Connection, apk: &Path) -> Result<String, String> {
+async fn install_one(conn: &Connection, apk: &Path, progress: &Progress) -> Result<String, String> {
     let remote = format!("/data/local/tmp/stt-{}.apk", std::process::id());
     let size = std::fs::metadata(apk).map_err(|e| e.to_string())?.len();
     // Allow ~1 MB/s plus slack for slow Wi-Fi.
     let upload_secs = 60 + size / 1_000_000;
-    conn.push(apk.to_path_buf(), remote.clone(), Duration::from_secs(upload_secs))
+    progress.reset(Unit::Bytes, size, apk.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    conn.push(apk.to_path_buf(), remote.clone(), Duration::from_secs(upload_secs), Some(progress.clone()))
         .await
         .map_err(|e| format!("upload failed: {e}"))?;
+    progress.set_detail("Installing on the TV…");
     let result = sh(conn, &format!("pm install -r -g '{remote}'"), 300).await;
     let _ = sh(conn, &format!("rm -f '{remote}'"), 10).await;
     let out = result?;
@@ -57,13 +60,13 @@ async fn install_one(conn: &Connection, apk: &Path) -> Result<String, String> {
 }
 
 /// Install several APKs one after another; one log line each.
-pub async fn install_many(conn: Connection, apks: Vec<PathBuf>) -> Vec<String> {
+pub async fn install_many(conn: Connection, apks: Vec<PathBuf>, progress: Progress) -> Vec<String> {
     let previous = relax_verifier(&conn).await;
     let mut log = Vec::with_capacity(apks.len());
     for (i, apk) in apks.iter().enumerate() {
         let name = apk.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let prefix = if apks.len() > 1 { format!("[{}/{}] ", i + 1, apks.len()) } else { String::new() };
-        log.push(match install_one(&conn, apk).await {
+        log.push(match install_one(&conn, apk, &progress).await {
             Ok(_) => format!("{prefix}Installed {name}."),
             Err(e) => format!("{prefix}{name}: {}", e.replace('\n', " ")),
         });
@@ -74,9 +77,14 @@ pub async fn install_many(conn: Connection, apks: Vec<PathBuf>) -> Vec<String> {
 
 /// Install one APK, then run follow-up shell commands if it succeeded (e.g.
 /// a permission `-g` can't grant).
-pub async fn install_with(conn: Connection, apk: PathBuf, post_install: &'static [&'static str]) -> Result<String, String> {
+pub async fn install_with(
+    conn: Connection,
+    apk: PathBuf,
+    post_install: &'static [&'static str],
+    progress: Progress,
+) -> Result<String, String> {
     let previous = relax_verifier(&conn).await;
-    let result = install_one(&conn, &apk).await;
+    let result = install_one(&conn, &apk, &progress).await;
     restore_verifier(&conn, previous).await;
     result?;
     let mut lines = vec!["Installed.".to_owned()];
@@ -89,7 +97,7 @@ pub async fn install_with(conn: Connection, apk: PathBuf, post_install: &'static
 
 /// Is `package` installed?
 pub async fn is_installed(conn: &Connection, package: &str) -> bool {
-    conn.shell(format!("pm path {package}"), transport::SHORT).await.is_ok_and(|o| o.contains("package:"))
+    conn.shell(format!("pm path {}", super::shell_quote(package)), transport::SHORT).await.is_ok_and(|o| o.contains("package:"))
 }
 
 /// `*.apk` files directly inside `dir`, sorted by name.

@@ -8,17 +8,24 @@ repository = "https://github.com/Some1sm/smart-tv-toolkit"
 
 [dependencies]
 adb_client = { version = "3.2", default-features = false }
+apk-info-axml = "1.0.13"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "7"
+flate2 = "1"
 iced = { version = "0.14", features = ["tokio", "image"] }
+libadb = { version = "0.7", features = ["pairing", "host-keys"] }
 mdns-sd = "0.21"
 open = "5"
 rfd = "0.17"
 rsa = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
 tokio = { version = "1", features = ["time", "macros", "rt", "net"] }
 ureq = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 winresource = "0.1"

@@ -474,9 +474,9 @@ pub async fn apply(conn: Connection, fix: Fix) -> Result<String, String> {
                 _ => "Caches cleared.".into(),
             });
         }
-        Fix::Stop(p) => run(format!("am force-stop {p}"), 30).await?,
-        Fix::Disable(p) => run(format!("pm disable-user --user 0 {p}"), 30).await?,
-        Fix::Uninstall(p) => run(format!("pm uninstall --user 0 {p}"), 60).await?,
+        Fix::Stop(p) => run(format!("am force-stop {}", super::shell_quote(p)), 30).await?,
+        Fix::Disable(p) => run(format!("pm disable-user --user 0 {}", super::shell_quote(p)), 30).await?,
+        Fix::Uninstall(p) => run(format!("pm uninstall --user 0 {}", super::shell_quote(p)), 60).await?,
         Fix::Animations(scale) => {
             let cmds: Vec<String> = ANIMATION_KEYS.iter().map(|k| format!("settings put global {k} {scale}")).collect();
             run(cmds.join("; "), 30).await?

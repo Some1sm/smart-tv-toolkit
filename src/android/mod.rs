@@ -5,8 +5,11 @@ pub mod catalog;
 pub mod files;
 pub mod health;
 pub mod install;
+pub mod keyboard;
+pub mod labels;
 pub mod media;
 pub mod packages;
+pub mod pairing;
 pub mod remote;
 pub mod shizuku;
 pub mod sysinfo;
@@ -17,10 +20,39 @@ pub use transport::Connection;
 /// ADB's network debugging port.
 pub const ADB_PORT: u16 = 5555;
 
+/// A connected Android TV.
+#[derive(Debug, Clone)]
+pub struct Session {
+    /// `ip:port`
+    pub serial: String,
+    /// For quick, interactive commands (remote keys, reading settings…).
+    pub conn: Connection,
+    pub summary: DeviceSummary,
+}
+
+impl Session {
+    /// Android API level (0 if unknown).
+    pub fn sdk(&self) -> u32 {
+        self.summary.sdk.parse().unwrap_or(0)
+    }
+
+    /// A separate connection for long jobs (installs, transfers, compiling),
+    /// so they don't hold up the remote and other quick commands.
+    pub async fn job_connection(&self) -> Result<Connection, String> {
+        transport::connect(self.serial.clone()).await.map_err(|e| e.to_string())
+    }
+}
+
+/// Single-quote text for the TV's shell, so names with spaces or symbols
+/// arrive as one argument and can't run anything.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Outcome of connecting to a TV.
 #[derive(Debug, Clone)]
 pub enum ConnectResult {
-    Connected { serial: String, connection: Connection, summary: DeviceSummary },
+    Connected(Session),
     /// The TV is showing "Allow debugging?"; the user must accept it.
     NeedsApproval,
     Failed(String),
@@ -101,7 +133,7 @@ pub async fn connect(serial: String) -> ConnectResult {
         Err(e) => return ConnectResult::Failed(e.to_string()),
     };
     match fetch_summary(&connection).await {
-        Ok(summary) => ConnectResult::Connected { serial, connection, summary },
+        Ok(summary) => ConnectResult::Connected(Session { serial, conn: connection, summary }),
         Err(e) => ConnectResult::Failed(e),
     }
 }
@@ -156,12 +188,38 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             match connect(serial).await {
-                ConnectResult::Connected { summary, .. } => {
+                ConnectResult::Connected(Session { summary, .. }) => {
                     println!("{summary:?}\nlabel: {}", summary.label());
                     assert!(!summary.manufacturer.is_empty());
                 }
                 other => panic!("not connected: {other:?}"),
             }
+        });
+    }
+
+    /// Health check and a second (job) connection on a real TV; reads only:
+    /// `STT_TEST_TV=ip:port cargo test live_ping_and_job -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_ping_and_job() {
+        let serial = std::env::var("STT_TEST_TV").expect("set STT_TEST_TV=ip:port");
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let ConnectResult::Connected(session) = connect(serial).await else { panic!("not connected") };
+            let ping = session.conn.ping(std::time::Duration::from_secs(5)).await.expect("ping");
+            assert_eq!(ping, transport::Ping::Alive);
+            // A slow command on the job connection doesn't block the main one.
+            let job = session.job_connection().await.expect("job connection");
+            let slow = tokio::spawn(async move { job.shell("sleep 3; echo done", std::time::Duration::from_secs(10)).await });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let t = std::time::Instant::now();
+            assert_eq!(session.conn.ping(std::time::Duration::from_secs(5)).await.unwrap(), transport::Ping::Alive);
+            println!("main connection answered in {:?} while the job connection was busy", t.elapsed());
+            assert!(t.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(slow.await.unwrap().unwrap(), "done");
+            let size = session.conn.file_size("/system/build.prop".into()).await;
+            println!("build.prop size: {size:?}");
+            assert!(size.is_some_and(|s| s > 0));
         });
     }
 

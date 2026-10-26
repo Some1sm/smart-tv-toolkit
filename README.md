@@ -23,6 +23,11 @@ Get the latest build from the [Releases](../../releases) page:
   `Smart TV Toolkit.exe`; nothing else to install.
 - **macOS (Apple Silicon and Intel):** `SmartTVToolkit-<version>-macos-universal.dmg`.
   Open it and drag the app to Applications.
+- **Linux (x86_64):** `SmartTVToolkit-<version>-linux-x86_64.tar.gz`. Unpack it and run
+  `./install.sh` to add it to your app menu, or run `./smart-tv-toolkit` directly.
+
+The app checks GitHub once a day and shows a note in the sidebar when a newer
+version is out.
 
 The builds aren't signed with a paid developer certificate, so the first launch
 needs one extra click:
@@ -45,8 +50,23 @@ Android SDK aren't needed.
   Tick **Always allow**. The key is stored where adb keeps its own
   (`~/.android/adbkey`), so a PC that already used adb with the TV is trusted
   straight away.
-- Android 11+ **Wireless debugging** (pairing code) isn't supported yet; TVs with
-  classic network debugging on port 5555 work.
+- TVs that only offer Android 11+ **Wireless debugging**: open *Pair device with
+  pairing code* on the TV, then use **Pair with a code** in the sidebar with the
+  IP:port and six digits it shows. After pairing, connect with the port shown under
+  *IP address & port* (the app fills it in when the TV announces it).
+- The app remembers the last TV and reconnects on launch, and reconnects by itself
+  if the connection drops (e.g. after the TV sleeps).
+
+## Features worth knowing
+
+- **Packages** shows real app names (read from each APK and cached), not just
+  package ids. For the long system list, use **Load real names**.
+- **Tools → Type text** handles accents and other scripts by installing the small
+  ADBKeyboard helper on the TV the first time it's needed.
+- **Media → scrcpy:** point the app at your scrcpy (**Locate…**) or let it download
+  the latest release, checked against its published SHA-256 sums.
+- Long jobs (installs, transfers, compiling) run on their own connection and show
+  progress at the bottom, so the remote and other tabs keep working meanwhile.
 
 ## Building
 
@@ -95,12 +115,15 @@ tests on Windows and macOS.
 
 1. Foundation: window, sidebar and tabs, built-in ADB (no adb.exe), connect by IP ✅
 2. Devices: network scan ✅, mDNS discovery ✅, device history ✅ (imports the original's
-   `devices.json`), wireless pairing
+   `devices.json`), Android 11+ pairing ✅
 3. Info tab and Health Check ✅
 4. Packages ✅, Performance ✅, Install ✅, Remote ✅, Screenshot ✅, Settings ✅, Tools ✅,
    Media (scrcpy, screen recording, file browser) ✅
-5. Packaging: Windows zip and universal macOS app with icons, license notices, and
-   GitHub Actions for tests and releases ✅
+5. Packaging: Windows zip, universal macOS app and Linux tarball with icons, license
+   notices, and GitHub Actions for tests and releases ✅
+
+Next: LG webOS and Samsung Tizen. Each platform is a `Session` variant in
+`src/platform.rs` that lists the tabs it supports; tabs live in `src/tabs/`.
 
 ## License
 

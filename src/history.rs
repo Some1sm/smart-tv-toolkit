@@ -38,7 +38,8 @@ pub fn path() -> Option<PathBuf> {
 
 pub fn load_from(path: &Path) -> Result<History, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&text).map_err(|e| format!("not a devices.json file: {e}"))
+    // Editors such as Windows Notepad may add a byte-order mark.
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("not a devices.json file: {e}"))
 }
 
 pub fn load() -> History {

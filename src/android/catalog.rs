@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::jobs::{CountingReader, Progress};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// GitHub releases; `tag` pins one release, otherwise the latest.
@@ -89,6 +91,15 @@ pub const APPS: [AppSpec; 7] = [
 pub const SHIZUKU: AppSpec = spec("Shizuku", "shizuku",
     "Lets apps use system APIs through ADB, without root.", "https://github.com/RikkaApps/Shizuku",
     Source::GitHub { repo: "RikkaApps/Shizuku", tag: None });
+
+/// Helper keyboard for typing non-ASCII text (accents, other scripts) on the
+/// TV; `input text` can only send ASCII. Its APKs are published as
+/// pre-releases, so the build the README calls stable is pinned.
+pub const ADB_KEYBOARD: AppSpec = AppSpec {
+    contains: "keyboardservice",
+    ..spec("ADBKeyboard", "adbkeyboard", "Keyboard that types text sent from this app, including accents.",
+           "https://github.com/senzhk/ADBKeyBoard", Source::GitHub { repo: "senzhk/ADBKeyBoard", tag: Some("v2.4-dev") })
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -189,13 +200,15 @@ pub fn resolve(spec: &AppSpec, token: Option<&str>) -> Result<(String, String), 
 
 /// Download `url` to `dest` (blocking), via a temp file so a failed download
 /// never leaves a broken APK behind.
-fn download(url: &str, dest: &Path) -> Result<u64, String> {
+fn download(url: &str, dest: &Path, progress: &Progress) -> Result<u64, String> {
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = dest.with_extension("part");
     let mut resp = ureq::get(url).header("User-Agent", DOWNLOAD_AGENT).call().map_err(|e| e.to_string())?;
-    let mut reader = resp.body_mut().with_config().limit(1024 * 1024 * 1024).reader();
+    progress.set_total(resp.body().content_length().unwrap_or(0));
+    let reader = resp.body_mut().with_config().limit(1024 * 1024 * 1024).reader();
+    let mut reader = CountingReader { inner: reader, progress: progress.clone() };
     let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let size = std::io::copy(&mut reader, &mut file).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -207,12 +220,13 @@ fn download(url: &str, dest: &Path) -> Result<u64, String> {
 }
 
 /// Resolve and download the right build of `spec` for a TV with `abis`.
-pub async fn fetch(spec: AppSpec, abis: Vec<String>) -> Result<String, String> {
+pub async fn fetch(spec: AppSpec, abis: Vec<String>, progress: Progress) -> Result<String, String> {
     let (token, _, note) = build_for(&spec, &abis)?;
     let dest = download_path(&spec, &abis).ok_or("no data folder")?;
     let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let (url, tag) = resolve(&spec, token)?;
-        let size = download(&url, &dest)?;
+        progress.set_detail(format!("{} {tag}", spec.name));
+        let size = download(&url, &dest, &progress)?;
         let note = note.map(|n| format!(", {n}")).unwrap_or_default();
         Ok(format!("Downloaded {} {tag} ({}{note}).", spec.name, super::sysinfo::fmt_bytes(size)))
     });
@@ -281,7 +295,7 @@ mod tests {
     #[ignore]
     fn live_resolve() {
         let tv = abis(&["armeabi-v7a", "armeabi"]);
-        for spec in APPS.iter().chain([&SHIZUKU]) {
+        for spec in APPS.iter().chain([&SHIZUKU, &ADB_KEYBOARD]) {
             match build_for(spec, &tv).and_then(|(token, _, _)| resolve(spec, token)) {
                 Ok((url, tag)) => println!("{:16} {tag:14} {url}", spec.name),
                 Err(e) => println!("{:16} ERROR {e}", spec.name),

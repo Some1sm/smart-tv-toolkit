@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::health::pretty_pkg_name;
+use crate::jobs::{Progress, Unit};
 use super::Connection;
 
 const PLAY_STORE: &str = "com.android.vending";
@@ -164,6 +165,7 @@ impl Action {
     }
 
     fn command(self, pkg: &str) -> String {
+        let pkg = super::shell_quote(pkg);
         match self {
             Action::Uninstall => format!("pm uninstall --user 0 {pkg}"),
             Action::Disable => format!("pm disable-user --user 0 {pkg}"),
@@ -194,23 +196,26 @@ impl Action {
 }
 
 /// Run `action` on each package in turn; returns one log line per package.
-pub async fn run(conn: Connection, action: Action, pkgs: Vec<String>) -> Vec<String> {
+pub async fn run(conn: Connection, action: Action, pkgs: Vec<String>, progress: Progress) -> Vec<String> {
     let mut log = Vec::with_capacity(pkgs.len());
+    progress.reset(Unit::Items, pkgs.len() as u64, "");
     for (i, pkg) in pkgs.iter().enumerate() {
+        progress.set_detail(pkg.clone());
         let prefix = if pkgs.len() > 1 { format!("[{}/{}] ", i + 1, pkgs.len()) } else { String::new() };
         let out = sh(&conn, &action.command(pkg), 60).await.unwrap_or_else(|e| e);
         let out = if out.is_empty() { "done".to_owned() } else { out.replace('\n', " ") };
         log.push(format!("{prefix}{} {pkg}: {out}", action.label()));
+        progress.add(1);
     }
     log
 }
 
 /// Save each package's APK into `dest`: `<pkg>.apk`, or a `<pkg>/` folder
 /// holding every split for app-bundle installs.
-pub async fn save_apks(conn: Connection, pkgs: Vec<String>, dest: PathBuf) -> Vec<String> {
+pub async fn save_apks(conn: Connection, pkgs: Vec<String>, dest: PathBuf, progress: Progress) -> Vec<String> {
     let mut log = Vec::new();
     for pkg in pkgs {
-        let paths: Vec<String> = match sh(&conn, &format!("pm path {pkg}"), 15).await {
+        let paths: Vec<String> = match sh(&conn, &format!("pm path {}", super::shell_quote(&pkg)), 15).await {
             Ok(out) => out.lines().filter_map(|l| l.trim().strip_prefix("package:")).map(str::to_owned).collect(),
             Err(e) => {
                 log.push(format!("{pkg}: {e}"));
@@ -232,7 +237,9 @@ pub async fn save_apks(conn: Connection, pkgs: Vec<String>, dest: PathBuf) -> Ve
             paths.iter().map(|p| (p.clone(), dir.join(Path::new(p).file_name().unwrap_or_default()))).collect()
         };
         for (remote, local) in targets {
-            match conn.pull(remote.clone(), local.clone(), Duration::from_secs(600)).await {
+            let file = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            progress.reset(Unit::Bytes, conn.file_size(remote.clone()).await.unwrap_or(0), file);
+            match conn.pull(remote.clone(), local.clone(), Duration::from_secs(600), Some(progress.clone())).await {
                 Ok(size) => log.push(format!("Saved {} ({})", local.display(), super::sysinfo::fmt_bytes(size))),
                 Err(e) => log.push(format!("{pkg}: failed to pull {remote}: {e}")),
             }
@@ -291,7 +298,7 @@ mod tests {
         rt.block_on(async {
             let conn = crate::android::transport::connect(serial).await.expect("connect");
             let t = std::time::Instant::now();
-            for line in save_apks(conn, vec![pkg], dir).await {
+            for line in save_apks(conn, vec![pkg], dir, Progress::new(Unit::Bytes)).await {
                 println!("{line}");
             }
             println!("took {:?}", t.elapsed());

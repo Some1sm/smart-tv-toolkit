@@ -10,11 +10,13 @@
 //! (port 5555) work as-is.
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adb_client::{ADBDeviceExt, RustADBError, tcp::ADBTcpDevice};
+
+use crate::jobs::{CountingReader, CountingWriter, Progress, Unit};
 
 /// Default timeout for short commands such as `getprop`.
 pub const SHORT: Duration = Duration::from_secs(10);
@@ -61,22 +63,27 @@ pub struct Connection {
     device: Arc<Mutex<ADBTcpDevice>>,
 }
 
+/// Result of a health check on a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ping {
+    Alive,
+    /// Another command is still running on this connection.
+    Busy,
+}
+
 impl Connection {
-    /// Run a shell command and return stdout and stderr, decoded lossily
-    /// (device output is not always valid UTF-8).
-    pub async fn shell(&self, command: impl Into<String>, timeout: Duration) -> Result<String, Error> {
+    /// Run `work` with the device on a blocking thread, giving up after
+    /// `timeout`. (A command that never returns keeps its thread and lock;
+    /// the health check notices that and reconnects.)
+    async fn with_device<T: Send + 'static>(
+        &self,
+        timeout: Duration,
+        work: impl FnOnce(&mut ADBTcpDevice) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
         let device = self.device.clone();
-        let command = command.into();
         let task = tokio::task::spawn_blocking(move || {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
             let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
-            device
-                .shell_command(&command, Some(&mut stdout), Some(&mut stderr))
-                .map_err(adb_error)?;
-            let mut text = String::from_utf8_lossy(&stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&stderr));
-            Ok(text.trim().to_owned())
+            work(&mut device)
         });
         match tokio::time::timeout(timeout, task).await {
             Ok(Ok(result)) => result,
@@ -85,56 +92,86 @@ impl Connection {
         }
     }
 
-    /// Copy a local file to `remote` on the TV.
-    pub async fn push(&self, local: PathBuf, remote: String, timeout: Duration) -> Result<(), Error> {
+    /// Run a shell command and return stdout and stderr, decoded lossily
+    /// (device output is not always valid UTF-8).
+    pub async fn shell(&self, command: impl Into<String>, timeout: Duration) -> Result<String, Error> {
+        let command = command.into();
+        self.with_device(timeout, move |device| {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            device.shell_command(&command, Some(&mut stdout), Some(&mut stderr)).map_err(adb_error)?;
+            let mut text = String::from_utf8_lossy(&stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&stderr));
+            Ok(text.trim().to_owned())
+        })
+        .await
+    }
+
+    /// Is the TV still answering? Doesn't queue behind a running command:
+    /// if one holds the connection it reports [`Ping::Busy`] instead.
+    pub async fn ping(&self, timeout: Duration) -> Result<Ping, Error> {
         let device = self.device.clone();
         let task = tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::File::open(&local).map_err(|e| Error::Adb(e.to_string()))?;
-            let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
-            device.push(&mut file, &remote).map_err(adb_error)
+            let mut device = match device.try_lock() {
+                Ok(d) => d,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(Ping::Busy),
+                Err(_) => return Err(Error::Adb("connection lost".into())),
+            };
+            let mut out = Vec::new();
+            device.shell_command(&"echo ok", Some(&mut out), None).map_err(adb_error)?;
+            if String::from_utf8_lossy(&out).contains("ok") { Ok(Ping::Alive) } else { Err(Error::Timeout) }
         });
         match tokio::time::timeout(timeout, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(join)) => Err(Error::Adb(join.to_string())),
             Err(_) => Err(Error::Timeout),
         }
+    }
+
+    /// Copy a local file to `remote` on the TV, counting bytes into `progress`.
+    pub async fn push(&self, local: PathBuf, remote: String, timeout: Duration, progress: Option<Progress>) -> Result<(), Error> {
+        self.with_device(timeout, move |device| {
+            let file = std::fs::File::open(&local).map_err(|e| Error::Adb(e.to_string()))?;
+            let progress = progress.unwrap_or_else(|| Progress::new(Unit::Bytes));
+            progress.set_total(file.metadata().map(|m| m.len()).unwrap_or(0));
+            let mut reader = CountingReader { inner: file, progress };
+            device.push(&mut reader, &remote).map_err(adb_error)
+        })
+        .await
+    }
+
+    /// Size of a file on the TV, if it exists (for progress bars).
+    pub async fn file_size(&self, remote: String) -> Option<u64> {
+        let out = self.shell(format!("stat -c %s {}", super::shell_quote(&remote)), SHORT).await.ok()?;
+        out.trim().parse().ok()
     }
 
     /// Read a file from the TV into memory.
     pub async fn pull_bytes(&self, remote: String, timeout: Duration) -> Result<Vec<u8>, Error> {
-        let device = self.device.clone();
-        let task = tokio::task::spawn_blocking(move || {
+        self.with_device(timeout, move |device| {
             let mut bytes = Vec::new();
-            let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
             device.pull(&remote, &mut bytes).map_err(adb_error)?;
             Ok(bytes)
-        });
-        match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(join)) => Err(Error::Adb(join.to_string())),
-            Err(_) => Err(Error::Timeout),
-        }
+        })
+        .await
     }
 
-    /// Copy a file from the TV to `local`. A partial file is removed on failure.
-    pub async fn pull(&self, remote: String, local: PathBuf, timeout: Duration) -> Result<u64, Error> {
-        let device = self.device.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::File::create(&local).map_err(|e| Error::Adb(e.to_string()))?;
-            let mut device = device.lock().map_err(|_| Error::Adb("connection lost".into()))?;
-            let result = device.pull(&remote, &mut file).map_err(adb_error);
-            drop(file);
+    /// Copy a file from the TV to `local`, counting bytes into `progress`.
+    /// A partial file is removed on failure.
+    pub async fn pull(&self, remote: String, local: PathBuf, timeout: Duration, progress: Option<Progress>) -> Result<u64, Error> {
+        self.with_device(timeout, move |device| {
+            let file = std::fs::File::create(&local).map_err(|e| Error::Adb(e.to_string()))?;
+            let progress = progress.unwrap_or_else(|| Progress::new(Unit::Bytes));
+            let mut writer = CountingWriter { inner: file, progress };
+            let result = device.pull(&remote, &mut writer).map_err(adb_error);
+            drop(writer);
             if result.is_err() {
                 let _ = std::fs::remove_file(&local);
             }
             result?;
             Ok(std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0))
-        });
-        match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(join)) => Err(Error::Adb(join.to_string())),
-            Err(_) => Err(Error::Timeout),
-        }
+        })
+        .await
     }
 }
 
@@ -172,9 +209,10 @@ pub fn key_path() -> Option<PathBuf> {
 /// Return the key path, generating and saving a key if there is none.
 /// Without a saved key every connection would use a new random key and the
 /// TV would ask to allow debugging each time.
-fn ensure_key() -> Result<PathBuf, String> {
+pub fn ensure_key() -> Result<PathBuf, String> {
     let path = key_path().ok_or("no home directory for the ADB key")?;
     if path.is_file() {
+        make_private(&path);
         return Ok(path);
     }
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
@@ -183,6 +221,39 @@ fn ensure_key() -> Result<PathBuf, String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, pem.as_bytes()).map_err(|e| e.to_string())?;
+    write_private(&path, pem.as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// Write a file only the current user can read: whoever holds the key can
+/// control every TV that trusts it. (Windows: the user profile is already
+/// private, so a plain write is enough.)
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Tighten an existing key that other users could read (e.g. one written
+/// by an older version of this app).
+fn make_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

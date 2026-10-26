@@ -44,13 +44,13 @@ pub async fn start(conn: Connection) -> Result<String, String> {
 }
 
 /// Install the downloaded Shizuku if it isn't installed yet, then start it.
-pub async fn install_and_start(conn: Connection) -> Result<String, String> {
+pub async fn install_and_start(conn: Connection, progress: crate::jobs::Progress) -> Result<String, String> {
     let mut lines = Vec::new();
     if install::is_installed(&conn, PACKAGE).await {
         lines.push("Shizuku is already installed.".to_owned());
     } else {
         let apk = catalog::download_path(&SHIZUKU, &[]).filter(|p| p.is_file()).ok_or("Download Shizuku first.")?;
-        install::install_with(conn.clone(), apk, &[]).await.map_err(|e| format!("Shizuku install failed: {e}"))?;
+        install::install_with(conn.clone(), apk, &[], progress).await.map_err(|e| format!("Shizuku install failed: {e}"))?;
         lines.push("Shizuku installed.".to_owned());
     }
     lines.push(start(conn).await?);

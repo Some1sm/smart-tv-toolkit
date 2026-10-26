@@ -23,4 +23,7 @@ Software Foundation, version 3. It is distributed WITHOUT ANY WARRANTY; see
 - [iced](https://iced.rs) and the other Rust crates in `Cargo.toml` are used
   under their own licenses (mostly MIT and/or Apache-2.0).
 - The ADB protocol is implemented by the [adb_client](https://github.com/cocool97/adb_client)
-  crate (MIT). No Android SDK Platform-Tools binaries are included or required.
+  crate (MIT), and Android 11+ pairing by [libadb](https://github.com/tarigo/libadb) (MIT).
+  No Android SDK Platform-Tools binaries are included or required.
+- Downloaded only when the user asks, never bundled: scrcpy (Apache-2.0), ADBKeyboard
+  (GPL-2.0), Shizuku and the quick-install apps, each under its own license.

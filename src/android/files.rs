@@ -5,10 +5,8 @@ use std::time::Duration;
 
 use super::Connection;
 
-/// Single-quote a path for the TV's shell (paths can contain spaces).
-pub fn quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', "'\\''"))
-}
+pub use super::shell_quote as quote;
+use crate::jobs::{Progress, Unit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -57,17 +55,20 @@ pub async fn list(conn: Connection, dir: String) -> Result<Vec<Entry>, String> {
 }
 
 /// Copy a local file into a folder on the TV.
-pub async fn send(conn: Connection, local: PathBuf, remote_dir: String) -> Result<String, String> {
+pub async fn send(conn: Connection, local: PathBuf, remote_dir: String, progress: Progress) -> Result<String, String> {
     let name = local.file_name().ok_or("not a file")?.to_string_lossy().into_owned();
     let remote = format!("{}{name}", as_dir(&remote_dir));
     let size = std::fs::metadata(&local).map_err(|e| e.to_string())?.len();
-    conn.push(local, remote.clone(), Duration::from_secs(60 + size / 1_000_000)).await.map_err(|e| e.to_string())?;
+    progress.set_detail(name.clone());
+    conn.push(local, remote.clone(), Duration::from_secs(60 + size / 1_000_000), Some(progress))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(format!("Sent {name} to {remote} ({}).", super::sysinfo::fmt_bytes(size)))
 }
 
 /// Copy a file or a whole folder from the TV into `dest` on the PC.
 /// Returns one log line per file plus a summary.
-pub async fn download(conn: Connection, remote: String, dest: PathBuf) -> Vec<String> {
+pub async fn download(conn: Connection, remote: String, dest: PathBuf, progress: Progress) -> Vec<String> {
     let remote = remote.trim().to_owned();
     let is_dir = conn
         .shell(format!("[ -d {} ] && echo DIR", quote(&remote)), Duration::from_secs(10))
@@ -95,14 +96,21 @@ pub async fn download(conn: Connection, remote: String, dest: PathBuf) -> Vec<St
 
     let mut log = Vec::new();
     let (mut ok, mut total) = (0usize, 0u64);
-    for (src, local) in &files {
+    let count = files.len() as u64;
+    for (i, (src, local)) in files.iter().enumerate() {
+        let name = src.rsplit('/').next().unwrap_or(src);
+        let detail = if count > 1 { format!("{name} ({} of {count})", i + 1) } else { name.to_owned() };
+        progress.reset(Unit::Bytes, 0, detail);
+        if let Some(size) = conn.file_size(src.clone()).await {
+            progress.set_total(size);
+        }
         if let Some(dir) = local.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
             log.push(format!("Can't create {}: {e}", dir.display()));
             continue;
         }
-        match conn.pull(src.clone(), local.clone(), Duration::from_secs(900)).await {
+        match conn.pull(src.clone(), local.clone(), Duration::from_secs(900), Some(progress.clone())).await {
             Ok(size) => {
                 ok += 1;
                 total += size;

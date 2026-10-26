@@ -94,7 +94,10 @@ pub fn merge(
 
             Entry {
                 ip,
-                port: saved.map(|s| s.port).or_else(|| announced.and_then(|d| d.adb_port)).unwrap_or(crate::android::ADB_PORT),
+                port: saved
+                    .map(|s| s.port)
+                    .or_else(|| announced.and_then(|d| d.adb_port.or(d.tls_port)))
+                    .unwrap_or(crate::android::ADB_PORT),
                 title,
                 detail: detail.join(" · "),
                 reach,

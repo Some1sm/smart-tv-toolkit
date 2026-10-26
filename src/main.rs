@@ -35,12 +35,19 @@ const SCAN_TIMEOUT: Duration = Duration::from_millis(600);
 const MDNS_LISTEN: Duration = Duration::from_secs(3);
 
 pub fn main() -> iced::Result {
+    let window = iced::window::Settings {
+        size: iced::Size::new(1100.0, 700.0),
+        // Below this the sidebar, tab bar and log no longer fit.
+        min_size: Some(iced::Size::new(900.0, 560.0)),
+        position: iced::window::Position::Centered,
+        icon: iced::window::icon::from_file_data(include_bytes!("../assets/icon-256.png"), None).ok(),
+        ..Default::default()
+    };
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((1100.0, 700.0))
-        .centered()
+        .window(window)
         .run()
 }
 

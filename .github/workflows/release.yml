@@ -11,7 +11,7 @@ jobs:
   licenses:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check the tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -25,7 +25,7 @@ jobs:
         with:
           tool: cargo-about
       - run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: licenses
           path: THIRD-PARTY-LICENSES.html
@@ -34,15 +34,15 @@ jobs:
     needs: licenses
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
       - run: .\scripts\package-windows.ps1
         shell: pwsh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*.zip
@@ -51,16 +51,16 @@ jobs:
     needs: licenses
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
       - run: bash scripts/bundle-macos.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*.dmg
@@ -72,12 +72,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
       # A draft, so the release notes can be checked before publishing.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true

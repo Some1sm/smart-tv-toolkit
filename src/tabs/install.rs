@@ -3,14 +3,15 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, space, text};
+use iced::widget::{button, column, container, row, space};
 use iced::{Alignment, Element, Fill, Task};
 
 use super::{Ctx, View};
+use crate::ui::text;
 use crate::android::catalog::{self, AppSpec, SHIZUKU};
 use crate::android::{install, shizuku};
 use crate::jobs::{JobId, Unit};
-use crate::theme;
+use crate::design::{self as ds, style};
 use crate::ui;
 
 #[derive(Debug, Default)]
@@ -22,6 +23,11 @@ pub struct State {
     /// Checked when it can change, not on every redraw.
     downloaded: BTreeSet<&'static str>,
     busy: bool,
+    /// Catalog apps installed on the TV: package → version.
+    installed: std::collections::HashMap<String, String>,
+    /// Newest release per catalog app name.
+    latest: std::collections::HashMap<&'static str, String>,
+    checked_updates: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +41,10 @@ pub enum Msg {
     ShizukuInstall,
     ShizukuStart,
     Done(JobId, Result<Vec<String>, String>),
+    BatchDone(JobId, super::Target, Result<Vec<String>, String>),
     OpenUrl(&'static str),
+    Installed(std::collections::HashMap<String, String>),
+    Latest(&'static str, Result<String, String>),
 }
 
 fn spec(name: &str) -> Option<AppSpec> {
@@ -52,6 +61,22 @@ impl State {
     pub fn on_connect(&mut self, ctx: &mut Ctx) {
         self.abis = ctx.android().map(|s| s.summary.abis).unwrap_or_default();
         self.refresh_downloaded();
+    }
+
+    /// Check for newer versions of installed catalog apps, once per
+    /// connection: versions on the TV (read-only) and latest releases.
+    pub fn on_open(&mut self, ctx: &mut Ctx) -> Task<Msg> {
+        let Some(conn) = ctx.conn() else { return Task::none() };
+        if self.checked_updates {
+            return Task::none();
+        }
+        self.checked_updates = true;
+        let mut tasks = vec![Task::perform(catalog::installed_versions(conn), Msg::Installed)];
+        for spec in catalog::APPS.iter().chain([&SHIZUKU]).filter(|s| catalog::package_id(s).is_some()) {
+            let name = spec.name;
+            tasks.push(Task::perform(catalog::latest_version(*spec), move |r| Msg::Latest(name, r)));
+        }
+        Task::batch(tasks)
     }
 
     fn refresh_downloaded(&mut self) {
@@ -87,7 +112,10 @@ impl State {
                 ctx.log(format!("Installing {} APK(s)…", apks.len()));
                 self.busy = true;
                 let title = format!("Installing {} APK(s)", apks.len());
-                return ctx.job(title, Unit::Bytes, move |conn, p| install::install_many(conn, apks, p), Msg::Done);
+                let others = apks.clone();
+                let batch = ctx.job_on_batch(&title, Unit::Bytes, move |conn, p| install::install_many(conn, others.clone(), p), Msg::BatchDone);
+                let here = ctx.job(title, Unit::Bytes, move |conn, p| install::install_many(conn, apks, p), Msg::Done);
+                return Task::batch([here, batch]);
             }
             Msg::Download(name) => {
                 let Some(spec) = spec(name) else { return Task::none() };
@@ -112,7 +140,14 @@ impl State {
                 ctx.log(format!("Installing {name}…"));
                 self.busy = true;
                 let post = spec.post_install;
-                return ctx.job(
+                let other_apk = apk.clone();
+                let batch = ctx.job_on_batch(
+                    &format!("Installing {name}"),
+                    Unit::Bytes,
+                    move |conn, p| install::install_with(conn, other_apk.clone(), post, p),
+                    move |id, target, r| Msg::BatchDone(id, target, r.map(|inner| vec![format!("{name}: {}", inner.unwrap_or_else(|e| e))])),
+                );
+                let here = ctx.job(
                     format!("Installing {name}"),
                     Unit::Bytes,
                     move |conn, p| install::install_with(conn, apk, post, p),
@@ -123,6 +158,7 @@ impl State {
                         }]))
                     },
                 );
+                return Task::batch([here, batch]);
             }
             Msg::ShizukuInstall => {
                 ctx.log("Installing and starting Shizuku…");
@@ -145,6 +181,27 @@ impl State {
                     Ok(lines) => lines.into_iter().for_each(|l| ctx.log(l)),
                     Err(e) => ctx.log(format!("Install failed: {e}")),
                 }
+                // Show the new version straight away.
+                if let Some(conn) = ctx.conn() {
+                    return Task::perform(catalog::installed_versions(conn), Msg::Installed);
+                }
+            }
+            Msg::BatchDone(id, target, result) => {
+                ctx.jobs.finish(id);
+                match result {
+                    Ok(lines) => lines.into_iter().for_each(|l| ctx.log(format!("[{}] {l}", target.label))),
+                    Err(e) => ctx.log(format!("[{}] Install failed: {e}", target.label)),
+                }
+            }
+            Msg::Installed(found) => {
+                if ctx.session.is_some() {
+                    self.installed = found;
+                }
+            }
+            Msg::Latest(name, result) => {
+                if let Ok(version) = result {
+                    self.latest.insert(name, version);
+                }
             }
             Msg::OpenUrl(url) => {
                 if let Err(e) = open::that(url) {
@@ -165,41 +222,53 @@ impl State {
             (Ok((_, _, note)), true) => format!("Downloaded{}", note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()),
             (Ok(_), false) => String::new(),
         };
+        // Installed on the TV, and is there something newer?
+        let installed = catalog::package_id(spec).and_then(|p| self.installed.get(p));
+        let version_note: Option<(String, iced::Color)> = installed.map(|v| match self.latest.get(spec.name) {
+            Some(latest) if crate::update::is_newer(latest, v) => {
+                (crate::i18n::trf("Installed {} · {} available", &[v, latest]), ds::AMBER)
+            }
+            Some(_) => (crate::i18n::trf("Installed {} · up to date", &[v]), ds::GREEN),
+            None => (crate::i18n::trf("Installed {}", &[v]), ds::TEXT_TERTIARY),
+        });
         let download_label = if downloading { "Downloading…" } else if downloaded { "Update" } else { "Download" };
         let buttons = row![
-            ui::small_button(download_label, theme::secondary_button, (!downloading && build.is_ok()).then_some(Msg::Download(spec.name))),
-            ui::small_button("Install", theme::primary_button, (downloaded && !downloading && !self.busy).then_some(Msg::QuickInstall(spec.name))),
-            text(status).size(11).color(theme::TEXT_DISABLED),
+            ui::small_button(download_label, style::standard, (!downloading && build.is_ok()).then_some(Msg::Download(spec.name))),
+            ui::small_button("Install", style::primary, (downloaded && !downloading && !self.busy).then_some(Msg::QuickInstall(spec.name))),
+            text(status).size(11).color(ds::TEXT_TERTIARY),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
         container(
             column![
-                button(text(spec.name).size(13).color(theme::PRIMARY))
+                button(text(spec.name).size(13).color(ds::ACCENT))
                     .padding(0)
                     .style(|_, _| button::Style::default())
                     .on_press(Msg::OpenUrl(spec.homepage)),
-                text(spec.description).size(11).color(theme::TEXT_MUTED),
+                text(spec.description).size(11).color(ds::TEXT_SECONDARY),
+                ds::label(version_note.as_ref().map(|(t, _)| t.clone()).unwrap_or_default(), ds::TEXT_SM, version_note.as_ref().map_or(ds::TEXT_TERTIARY, |(_, c)| *c)),
                 buttons,
             ]
             .spacing(6),
         )
         .padding(12)
         .width(Fill)
-        .style(theme::card)
+        .style(style::well)
         .into()
     }
 
-    pub fn view<'a>(&'a self, _v: &View<'a>) -> Element<'a, Msg> {
+    pub fn view<'a>(&'a self, v: &View<'a>) -> Element<'a, Msg> {
+        let batch = v.batch_note().map(|note| format!("{note} (ticked in the sidebar).")).unwrap_or_default();
         let apk = ui::card(
             "Install APK",
             column![
                 text("Pick APK files, or a folder of them. Play Protect's install checks are paused during the install and put back as they were afterwards.")
                     .size(12)
-                    .color(theme::TEXT_MUTED),
+                    .color(ds::TEXT_SECONDARY),
+                ds::label(batch, ds::TEXT_SM, ds::ACCENT),
                 row![
-                    ui::small_button("Install APK files…", theme::primary_button, (!self.busy).then_some(Msg::PickApks)),
-                    ui::small_button("Install folder…", theme::secondary_button, (!self.busy).then_some(Msg::PickFolder)),
+                    ui::small_button("Install APK files…", style::primary, (!self.busy).then_some(Msg::PickApks)),
+                    ui::small_button("Install folder…", style::standard, (!self.busy).then_some(Msg::PickFolder)),
                 ]
                 .spacing(6),
             ]
@@ -227,11 +296,11 @@ impl State {
         let shizuku = ui::card(
             "Shizuku",
             column![
-                text(SHIZUKU.description).size(12).color(theme::TEXT_MUTED),
+                text(SHIZUKU.description).size(12).color(ds::TEXT_SECONDARY),
                 row![
-                    ui::small_button(label, theme::secondary_button, (!shizuku_downloading).then_some(Msg::Download(SHIZUKU.name))),
-                    ui::small_button("Install & Start", theme::primary_button, (shizuku_ready && !self.busy).then_some(Msg::ShizukuInstall)),
-                    ui::small_button("Start Shizuku", theme::secondary_button, (!self.busy).then_some(Msg::ShizukuStart)),
+                    ui::small_button(label, style::standard, (!shizuku_downloading).then_some(Msg::Download(SHIZUKU.name))),
+                    ui::small_button("Install & Start", style::primary, (shizuku_ready && !self.busy).then_some(Msg::ShizukuInstall)),
+                    ui::small_button("Start Shizuku", style::standard, (!self.busy).then_some(Msg::ShizukuStart)),
                 ]
                 .spacing(6),
             ]
@@ -239,6 +308,6 @@ impl State {
             .into(),
         );
 
-        scrollable(column![apk, quick, shizuku].spacing(8).padding(4)).into()
+        ui::page(column![apk, quick, shizuku].spacing(12))
     }
 }

@@ -1,11 +1,11 @@
 //! Info: everything the TV reports about itself.
 
-use iced::widget::{button, column, container, progress_bar, row, scrollable, text};
-use iced::{Element, Fill, Task};
+use iced::widget::{column, progress_bar, row, space};
+use iced::{Alignment, Element, Fill, Task};
 
 use super::{Ctx, View};
 use crate::android::sysinfo::{self, Section};
-use crate::theme;
+use crate::design::{self as ds, style};
 use crate::ui;
 
 #[derive(Debug, Default)]
@@ -59,7 +59,27 @@ impl State {
         Task::none()
     }
 
-    pub fn view<'a>(&'a self, _v: &View<'a>) -> Element<'a, Msg> {
+    pub fn view<'a>(&'a self, v: &View<'a>) -> Element<'a, Msg> {
+        // Samsung and LG TVs report a few facts over their remote API.
+        if let Some(session) = v.session
+            && let Some(facts) = session.facts()
+        {
+            let rows = facts.iter().map(|(label, value)| {
+                row![ds::label(label.as_str(), ds::TEXT_BASE, ds::TEXT_SECONDARY).width(170), ds::label(value.as_str(), ds::TEXT_BASE, ds::TEXT)]
+                    .spacing(12)
+                    .into()
+            });
+            let header = column![
+                ds::semibold("Device Overview", ds::TEXT_LG, ds::TEXT),
+                ds::label(
+                    crate::i18n::trf("{} · connected through the TV's own remote-control API", &[&crate::i18n::tr(session.platform().name())]),
+                    ds::TEXT_BASE,
+                    ds::TEXT_SECONDARY,
+                ),
+            ]
+            .spacing(2);
+            return ui::page(column![header, ui::card("Device", column(rows).spacing(10).into())].spacing(12));
+        }
         let Some(sections) = &self.sections else {
             return if self.loading {
                 ui::empty_state("Reading device info…", "")
@@ -70,38 +90,35 @@ impl State {
 
         let cards = sections.iter().map(|section| {
             let rows = section.fields.iter().map(|f| {
-                let mut value = column![text(&f.value).size(13).color(theme::TEXT)].spacing(4);
+                let mut value = column![ds::label(&f.value, ds::TEXT_BASE, ds::TEXT)].spacing(6);
                 if let Some(used) = f.usage {
-                    value = value.push(progress_bar(0.0..=1.0, used).length(320).girth(8).style(theme::usage_bar(used)));
+                    value = value.push(progress_bar(0.0..=1.0, used).length(320).girth(6).style(style::usage(used)));
                 }
-                row![
-                    text(format!("{}:", f.label))
-                        .size(13)
-                        .color(theme::TEXT_MUTED)
-                        .width(150)
-                        .align_x(iced::alignment::Horizontal::Right),
-                    value.width(Fill),
-                ]
-                .spacing(12)
-                .into()
+                row![ds::label(f.label, ds::TEXT_BASE, ds::TEXT_SECONDARY).width(170), value.width(Fill)].spacing(12).into()
             });
-            container(column![ui::section_title(section.title), column(rows).spacing(10)].spacing(10))
-                .padding(16)
-                .width(Fill)
-                .style(theme::panel)
-                .into()
+            ui::card(section.title, column(rows).spacing(10).into())
         });
 
-        let refresh = if self.loading { "Refreshing…" } else { "Refresh Info" };
-        let buttons = row![
-            button(text(refresh).size(13))
-                .padding([8, 16])
-                .style(theme::secondary_button)
-                .on_press_maybe((!self.loading).then_some(Msg::Refresh)),
-            button(text("Copy All").size(13)).padding([8, 16]).style(theme::secondary_button).on_press(Msg::Copy),
+        let header = row![
+            column![
+                ds::semibold("Device Overview", ds::TEXT_LG, ds::TEXT),
+                ds::label("Hardware, software, storage and network, read from the TV.", ds::TEXT_BASE, ds::TEXT_SECONDARY),
+            ]
+            .spacing(2),
+            space::horizontal(),
+            ds::icon_button(
+                Some((ds::Icon::RefreshCw, ds::TEXT_SECONDARY)),
+                if self.loading { "Refreshing…" } else { "Refresh" },
+                None,
+                style::standard,
+                32.0,
+                (!self.loading).then_some(Msg::Refresh),
+            ),
+            ds::icon_button(Some((ds::Icon::Copy, ds::TEXT_SECONDARY)), "Copy All", None, style::standard, 32.0, Some(Msg::Copy)),
         ]
-        .spacing(8);
+        .spacing(8)
+        .align_y(Alignment::Center);
 
-        scrollable(column(cards).push(container(buttons).center_x(Fill)).spacing(10).padding(4)).into()
+        ui::page(column![header].extend(cards).spacing(12))
     }
 }

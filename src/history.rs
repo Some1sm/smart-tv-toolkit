@@ -56,6 +56,21 @@ pub fn now() -> String {
     Local::now().format(TIME_FORMAT).to_string()
 }
 
+/// The TV's wired MAC address, for Wake-on-LAN.
+pub fn mac(history: &History, ip: &str) -> Option<String> {
+    history.get(ip)?.extra.get("mac")?.as_str().map(str::to_owned)
+}
+
+pub fn set_mac(history: &mut History, ip: &str, mac: &str) -> bool {
+    match history.get_mut(ip) {
+        Some(d) if d.extra.get("mac").and_then(|v| v.as_str()) != Some(mac) => {
+            d.extra.insert("mac".into(), serde_json::Value::String(mac.to_owned()));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Record a successful connection.
 pub fn remember(history: &mut History, ip: &str, port: u16, label: &str) {
     let entry = history.entry(ip.to_owned()).or_insert_with(|| SavedDevice {
@@ -91,10 +106,10 @@ pub fn age(last_seen: &str, now: NaiveDateTime) -> String {
     };
     let minutes = (now - seen).num_minutes();
     match minutes {
-        i64::MIN..2 => "just now".into(),
-        2..60 => format!("{minutes}m ago"),
-        60..1440 => format!("{}h ago", minutes / 60),
-        _ => format!("{}d ago", minutes / 1440),
+        i64::MIN..2 => crate::i18n::tr("just now").into(),
+        2..60 => crate::i18n::trf("{}m ago", &[&minutes]),
+        60..1440 => crate::i18n::trf("{}h ago", &[&(minutes / 60)]),
+        _ => crate::i18n::trf("{}d ago", &[&(minutes / 1440)]),
     }
 }
 

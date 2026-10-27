@@ -1,13 +1,15 @@
 //! The sidebar's device list: saved devices, scan results and mDNS
 //! announcements merged into one entry per IP.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 
 use chrono::NaiveDateTime;
 
 use crate::history::{self, History};
 use crate::mdns::MdnsDevice;
+use crate::i18n::tr;
+use crate::platform::Platform;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
@@ -28,7 +30,8 @@ pub struct Entry {
     pub ip: Ipv4Addr,
     pub port: u16,
     pub title: String,
-    pub detail: String,
+    /// e.g. "“Televisión” · Port 5555 open · seen 3h ago" (no address).
+    pub status: String,
     pub reach: Reach,
     pub saved: bool,
 }
@@ -36,11 +39,13 @@ pub struct Entry {
 /// Merge everything known into a list, reachable devices first.
 ///
 /// `open` holds IPs where ADB answered; `checked` holds every IP whose port
-/// has been probed (by a scan or the startup check), open or not.
+/// has been probed (by a scan or the startup check), open or not. `others`
+/// holds Samsung and LG TVs found by their remote-control port.
 pub fn merge(
     history: &History,
     open: &BTreeSet<Ipv4Addr>,
     checked: &BTreeSet<Ipv4Addr>,
+    others: &BTreeMap<Ipv4Addr, u16>,
     mdns: &[MdnsDevice],
     now: NaiveDateTime,
 ) -> Vec<Entry> {
@@ -49,6 +54,7 @@ pub fn merge(
 
     let mut ips: BTreeSet<Ipv4Addr> = history.keys().filter_map(|ip| ip.parse().ok()).collect();
     ips.extend(open);
+    ips.extend(others.keys());
     ips.extend(mdns_by_ip.keys());
 
     let mut entries: Vec<Entry> = ips
@@ -58,14 +64,22 @@ pub fn merge(
             let announced = mdns_by_ip.get(&ip).copied();
             let mdns_name = announced.and_then(|d| d.name.clone());
 
+            // A Samsung/LG remote API answering (and no ADB) makes it that kind of TV.
+            let remote_api = others.get(&ip).copied().filter(|_| !open.contains(&ip));
+            let platform = remote_api.map_or(Platform::AndroidTv, Platform::for_port);
+
             let title = saved
                 .map(|s| s.label.clone())
                 .filter(|l| !l.is_empty())
                 .or_else(|| mdns_name.clone())
                 .or_else(|| announced.and_then(|d| d.model.clone()))
-                .unwrap_or_else(|| ip.to_string());
+                .unwrap_or_else(|| match platform {
+                    Platform::Tizen => "Samsung TV".into(),
+                    Platform::WebOs => "LG TV".into(),
+                    Platform::AndroidTv => ip.to_string(),
+                });
 
-            let reach = if open.contains(&ip) {
+            let reach = if open.contains(&ip) || remote_api.is_some() {
                 Reach::Ready
             } else if announced.is_some_and(|d| d.wireless_debugging) {
                 Reach::NeedsPairing
@@ -77,32 +91,31 @@ pub fn merge(
                 Reach::Unknown
             };
 
-            let mut detail = vec![ip.to_string()];
+            let port = remote_api
+                .or_else(|| saved.map(|s| s.port))
+                .or_else(|| announced.and_then(|d| d.adb_port.or(d.tls_port)))
+                .unwrap_or(crate::android::ADB_PORT);
+
+            let mut status = Vec::new();
             // Show the TV's own name when the title is the model from getprop.
             if let Some(name) = mdns_name.filter(|n| *n != title) {
-                detail.push(format!("\"{name}\""));
+                status.push(format!("“{name}”"));
             }
-            match reach {
-                Reach::DebuggingOff => detail.push("debugging off".into()),
-                Reach::NeedsPairing => detail.push("needs pairing".into()),
-                _ => {
-                    if let Some(age) = saved.map(|s| history::age(&s.last_seen, now)).filter(|a| !a.is_empty()) {
-                        detail.push(format!("seen {age}"));
-                    }
-                }
+            status.push(match reach {
+                Reach::Ready if remote_api.is_some() => format!("{} · port {port}", platform.name()),
+                Reach::Ready => format!("Port {port} open"),
+                Reach::DebuggingOff => tr("Debugging off").into(),
+                Reach::NeedsPairing => tr("Needs pairing (Android 11+)").into(),
+                Reach::Offline => tr("Offline").into(),
+                Reach::Unknown => tr("Not checked yet").into(),
+            });
+            if matches!(reach, Reach::Ready | Reach::Offline | Reach::Unknown)
+                && let Some(age) = saved.map(|s| history::age(&s.last_seen, now)).filter(|a| !a.is_empty())
+            {
+                status.push(crate::i18n::trf("seen {}", &[&age]));
             }
 
-            Entry {
-                ip,
-                port: saved
-                    .map(|s| s.port)
-                    .or_else(|| announced.and_then(|d| d.adb_port.or(d.tls_port)))
-                    .unwrap_or(crate::android::ADB_PORT),
-                title,
-                detail: detail.join(" · "),
-                reach,
-                saved: saved.is_some(),
-            }
+            Entry { ip, port, title, status: status.join(" · "), reach, saved: saved.is_some() }
         })
         .collect();
 
@@ -136,10 +149,10 @@ mod tests {
                 crate::mdns::discover(std::time::Duration::from_secs(3))
             )
         });
-        let open = probed.iter().filter(|(_, o)| *o).map(|(ip, _)| *ip).collect();
-        let checked = probed.iter().map(|(ip, _)| *ip).collect();
-        for e in merge(&history, &open, &checked, &mdns.unwrap(), chrono::Local::now().naive_local()) {
-            println!("{:?} {} — {}", e.reach, e.title, e.detail);
+        let open = probed.iter().filter(|(_, _, o)| *o).map(|(ip, _, _)| *ip).collect();
+        let checked = probed.iter().map(|(ip, _, _)| *ip).collect();
+        for e in merge(&history, &open, &checked, &BTreeMap::new(), &mdns.unwrap(), chrono::Local::now().naive_local()) {
+            println!("{:?} {} — {}", e.reach, e.title, e.status);
         }
     }
 
@@ -162,14 +175,17 @@ mod tests {
             MdnsDevice { ip: Some(ip(50)), name: Some("Kitchen speaker".into()), ..Default::default() },
         ];
         let now = NaiveDateTime::parse_from_str("2026-10-26 12:00", "%Y-%m-%d %H:%M").unwrap();
-        let list = merge(&history, &open, &checked, &mdns, now);
+        let others = BTreeMap::from([(ip(60), 8002u16)]);
+        let list = merge(&history, &open, &checked, &others, &mdns, now);
 
         let titles: Vec<&str> = list.iter().map(|e| e.title.as_str()).collect();
         // Ready first (by title), then debugging-off, then offline; the speaker is dropped.
-        assert_eq!(titles, ["192.168.1.99", "Sony XR-65A80J", "Bedroom TV", "Google Chromecast"]);
+        assert_eq!(titles, ["192.168.1.99", "Samsung TV", "Sony XR-65A80J", "Bedroom TV", "Google Chromecast"]);
+        assert_eq!((list[1].port, list[1].status.as_str()), (8002, "Samsung Tizen · port 8002"));
+        let list: Vec<Entry> = list.into_iter().filter(|e| e.port != 8002).collect();
         let sony = &list[1];
         assert_eq!(sony.reach, Reach::Ready);
-        assert_eq!(sony.detail, "192.168.1.78 · \"Televisión\" · seen 3h ago");
+        assert_eq!(sony.status, "“Televisión” · Port 5555 open · seen 3h ago");
         assert!(sony.saved);
         assert_eq!(list[2].reach, Reach::DebuggingOff);
         assert_eq!(list[3].reach, Reach::Offline);

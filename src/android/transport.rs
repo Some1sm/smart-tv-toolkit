@@ -61,6 +61,22 @@ fn adb_error(e: RustADBError) -> Error {
 #[derive(Debug, Clone)]
 pub struct Connection {
     device: Arc<Mutex<ADBTcpDevice>>,
+    /// Kept to reopen the connection if it gets out of step.
+    addr: SocketAddr,
+    key: PathBuf,
+}
+
+/// The connection lost track of which message belongs to which command (a
+/// TV answered late). Reopening it starts clean.
+fn out_of_step(e: &Error) -> bool {
+    matches!(e, Error::Adb(m) if m.contains("Open session failed") || m.contains("for our local_id") || m.contains("unrelated"))
+}
+
+/// Commands that show something on the TV must never run twice; anything
+/// else is safe to repeat after a reconnect (reads, and settings that end
+/// up the same either way).
+fn repeatable(command: &str) -> bool {
+    !["input ", "am start", "monkey ", "am broadcast", "reboot", "screenrecord"].iter().any(|w| command.contains(w))
 }
 
 /// Result of a health check on a connection.
@@ -93,16 +109,27 @@ impl Connection {
     }
 
     /// Run a shell command and return stdout and stderr, decoded lossily
-    /// (device output is not always valid UTF-8).
+    /// (device output is not always valid UTF-8). If the connection got out
+    /// of step it's reopened, and the command retried when that's safe.
     pub async fn shell(&self, command: impl Into<String>, timeout: Duration) -> Result<String, Error> {
         let command = command.into();
+        let (addr, key) = (self.addr, self.key.clone());
         self.with_device(timeout, move |device| {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            device.shell_command(&command, Some(&mut stdout), Some(&mut stderr)).map_err(adb_error)?;
-            let mut text = String::from_utf8_lossy(&stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&stderr));
-            Ok(text.trim().to_owned())
+            let run = |device: &mut ADBTcpDevice| -> Result<String, Error> {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                device.shell_command(&command, Some(&mut stdout), Some(&mut stderr)).map_err(adb_error)?;
+                let mut text = String::from_utf8_lossy(&stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&stderr));
+                Ok(text.trim().to_owned())
+            };
+            match run(device) {
+                Err(e) if out_of_step(&e) => {
+                    reopen(device, addr, &key)?;
+                    if repeatable(&command) { run(device) } else { Err(e) }
+                }
+                other => other,
+            }
         })
         .await
     }
@@ -111,6 +138,7 @@ impl Connection {
     /// if one holds the connection it reports [`Ping::Busy`] instead.
     pub async fn ping(&self, timeout: Duration) -> Result<Ping, Error> {
         let device = self.device.clone();
+        let (addr, key) = (self.addr, self.key.clone());
         let task = tokio::task::spawn_blocking(move || {
             let mut device = match device.try_lock() {
                 Ok(d) => d,
@@ -118,7 +146,14 @@ impl Connection {
                 Err(_) => return Err(Error::Adb("connection lost".into())),
             };
             let mut out = Vec::new();
-            device.shell_command(&"echo ok", Some(&mut out), None).map_err(adb_error)?;
+            if let Err(e) = device.shell_command(&"echo ok", Some(&mut out), None).map_err(adb_error) {
+                if !out_of_step(&e) {
+                    return Err(e);
+                }
+                reopen(&mut device, addr, &key)?;
+                out.clear();
+                device.shell_command(&"echo ok", Some(&mut out), None).map_err(adb_error)?;
+            }
             if String::from_utf8_lossy(&out).contains("ok") { Ok(Ping::Alive) } else { Err(Error::Timeout) }
         });
         match tokio::time::timeout(timeout, task).await {
@@ -148,10 +183,20 @@ impl Connection {
 
     /// Read a file from the TV into memory.
     pub async fn pull_bytes(&self, remote: String, timeout: Duration) -> Result<Vec<u8>, Error> {
+        let (addr, key) = (self.addr, self.key.clone());
         self.with_device(timeout, move |device| {
-            let mut bytes = Vec::new();
-            device.pull(&remote, &mut bytes).map_err(adb_error)?;
-            Ok(bytes)
+            let run = |device: &mut ADBTcpDevice| {
+                let mut bytes = Vec::new();
+                device.pull(&remote, &mut bytes).map_err(adb_error)?;
+                Ok(bytes)
+            };
+            match run(device) {
+                Err(e) if out_of_step(&e) => {
+                    reopen(device, addr, &key)?;
+                    run(device)
+                }
+                other => other,
+            }
         })
         .await
     }
@@ -187,14 +232,23 @@ pub async fn connect(serial: String) -> Result<Connection, Error> {
         TcpStream::connect_timeout(&addr, REACH_TIMEOUT)
             .map_err(|e| Error::Unreachable(e.to_string()))?;
         let key = ensure_key().map_err(Error::Adb)?;
-        ADBTcpDevice::new_with_custom_private_key(addr, key).map_err(adb_error)
+        let device = ADBTcpDevice::new_with_custom_private_key(addr, &key).map_err(adb_error)?;
+        Ok((device, addr, key))
     });
     match tokio::time::timeout(CONNECT_TIMEOUT, task).await {
-        Ok(Ok(Ok(device))) => Ok(Connection { device: Arc::new(Mutex::new(device)) }),
+        Ok(Ok(Ok((device, addr, key)))) => Ok(Connection { device: Arc::new(Mutex::new(device)), addr, key }),
         Ok(Ok(Err(e))) => Err(e),
         Ok(Err(join)) => Err(Error::Adb(join.to_string())),
         Err(_) => Err(Error::NeedsApproval),
     }
+}
+
+/// Replace a connection that got out of step with a fresh one (the TV
+/// already trusts our key, so this takes a fraction of a second).
+fn reopen(device: &mut ADBTcpDevice, addr: SocketAddr, key: &Path) -> Result<(), Error> {
+    TcpStream::connect_timeout(&addr, REACH_TIMEOUT).map_err(|e| Error::Unreachable(e.to_string()))?;
+    *device = ADBTcpDevice::new_with_custom_private_key(addr, key).map_err(adb_error)?;
+    Ok(())
 }
 
 /// The key path adb itself uses, so keys are shared with any installed adb.

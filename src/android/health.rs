@@ -6,7 +6,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use super::sysinfo::{self, KB, fmt_bytes, parse_df, parse_meminfo, split_sections};
+use super::changes::{self, Outcome};
 use super::{Connection, transport};
+use crate::journal::{Change, PkgState};
 
 const SCRIPT: &str = "echo @@meminfo; cat /proc/meminfo; \
     echo @@df; df -k /data 2>/dev/null; \
@@ -223,7 +225,8 @@ impl Fix {
                 "Clear All App Caches".into(),
                 "Clear the cache of every app on the TV?\n\nLogins and settings are kept; apps rebuild \
                  their caches, so the first launch of each may be a little slower. Streaming apps \
-                 lose any video they had cached."
+                 lose any video they had cached.\n\nOn Android 13 and older, Android keeps part of the cache \
+                 of apps you use a lot; clear those one by one (Optimize → Storage → Clear Cache)."
                     .into(),
             )),
             Fix::Stop(p) => Some((
@@ -237,16 +240,14 @@ impl Fix {
             Fix::Uninstall(p) => Some(("Uninstall App".into(), format!("Uninstall {}?\n\nThis removes the app and its data.", name(p)))),
             Fix::CompileApps | Fix::AllOptimizations => Some((
                 self.label().into(),
-                "Compile every app ahead of time for faster launches?
-
-This takes several minutes and                  the TV may be slow meanwhile. Needs free storage space to work well."
+                "Compile every app ahead of time for faster launches?\n\nThis takes several minutes and \
+                 the TV may be slow meanwhile. Needs free storage space to work well."
                     .into(),
             )),
             Fix::KillBackground => Some((
                 "Kill Background Apps".into(),
-                "Stop all cached background apps?
-
-They restart when opened. Frees memory for a while;                  Android refills the cache as you use the TV."
+                "Stop all cached background apps?\n\nThey restart when opened. Frees memory for a while; \
+                 Android refills the cache as you use the TV."
                     .into(),
             )),
             Fix::Animations(_) | Fix::EnableFreezer => None,
@@ -434,7 +435,6 @@ pub async fn scan(conn: Connection) -> Result<Vec<Finding>, String> {
     Ok(findings(&split_sections(&raw)))
 }
 
-const FREEZER_ON: &str = "settings put global cached_apps_freezer enabled";
 const COMPILE: &str = "cmd package compile -m speed-profile -a";
 
 /// Summarise `cmd package compile -a`, which prints a result per package.
@@ -454,8 +454,45 @@ async fn data_free(conn: &Connection) -> Option<u64> {
     sysinfo::parse_df(&out).first().map(|r| r.avail)
 }
 
-/// Apply one fix; returns a line for the log.
-pub async fn apply(conn: Connection, fix: Fix) -> Result<String, String> {
+/// Apply one fix; returns a line for the log and the changes made.
+pub async fn apply(conn: Connection, fix: Fix) -> Result<Outcome, String> {
+    let note = |text: &str| Change::Note { text: text.to_owned() };
+    let done = |line: String, changes: Vec<Change>| Ok(Outcome { lines: vec![line], changes });
+    match &fix {
+        Fix::Disable(p) | Fix::Uninstall(p) => {
+            let target = if matches!(fix, Fix::Disable(_)) { PkgState::Disabled } else { PkgState::Uninstalled };
+            let (change, words) = changes::set_package(&conn, p, target).await?;
+            let words = if words.is_empty() { "done.".to_owned() } else { words };
+            return done(format!("{} {p}: {words}", fix.label()), vec![change]);
+        }
+        Fix::Animations(scale) => {
+            let mut made = Vec::new();
+            for key in ANIMATION_KEYS {
+                made.push(changes::put_setting(&conn, "global", key, Some(scale)).await?);
+            }
+            return done(format!("{}: done.", fix.label()), made);
+        }
+        Fix::EnableFreezer => {
+            let change = changes::put_setting(&conn, "global", "cached_apps_freezer", Some("enabled")).await?;
+            return done("App freezer on.".into(), vec![change]);
+        }
+        Fix::AllOptimizations => {
+            let change = changes::put_setting(&conn, "global", "cached_apps_freezer", Some("enabled")).await?;
+            let line = compile(conn.shell(COMPILE, Duration::from_secs(1800)).await.map_err(|e| e.to_string())?)?;
+            return done(format!("App freezer on. {line}"), vec![change, note("Compiled apps for speed")]);
+        }
+        _ => {}
+    }
+    let text = match &fix {
+        Fix::Stop(p) => format!("Stopped {p}"),
+        other => other.label().to_owned(),
+    };
+    let line = apply_once(conn, fix).await?;
+    done(line, vec![note(&text)])
+}
+
+/// Fixes that can't be undone, run as plain commands.
+async fn apply_once(conn: Connection, fix: Fix) -> Result<String, String> {
     let run = |cmd: String, secs: u64| {
         let conn = conn.clone();
         async move { conn.shell(cmd, Duration::from_secs(secs)).await.map_err(|e| e.to_string()) }
@@ -475,19 +512,10 @@ pub async fn apply(conn: Connection, fix: Fix) -> Result<String, String> {
             });
         }
         Fix::Stop(p) => run(format!("am force-stop {}", super::shell_quote(p)), 30).await?,
-        Fix::Disable(p) => run(format!("pm disable-user --user 0 {}", super::shell_quote(p)), 30).await?,
-        Fix::Uninstall(p) => run(format!("pm uninstall --user 0 {}", super::shell_quote(p)), 60).await?,
-        Fix::Animations(scale) => {
-            let cmds: Vec<String> = ANIMATION_KEYS.iter().map(|k| format!("settings put global {k} {scale}")).collect();
-            run(cmds.join("; "), 30).await?
-        }
-        Fix::EnableFreezer => run(FREEZER_ON.into(), 30).await?,
         Fix::CompileApps => return compile(run(COMPILE.into(), 1800).await?),
-        Fix::AllOptimizations => {
-            run(FREEZER_ON.into(), 30).await?;
-            return compile(run(COMPILE.into(), 1800).await?).map(|c| format!("App freezer on. {c}"));
-        }
         Fix::KillBackground => run("am kill-all".into(), 30).await?,
+        // Reversible fixes are handled by `apply`.
+        Fix::Disable(_) | Fix::Uninstall(_) | Fix::Animations(_) | Fix::EnableFreezer | Fix::AllOptimizations => String::new(),
     };
     Ok(if out.is_empty() { format!("{}: done.", fix.label()) } else { format!("{}: {out}", fix.label()) })
 }

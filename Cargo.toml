@@ -13,19 +13,29 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "7"
 flate2 = "1"
-iced = { version = "0.14", features = ["tokio", "image"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+iced = { version = "0.14", features = ["tokio", "image", "svg"] }
 libadb = { version = "0.7", features = ["pairing", "host-keys"] }
+lucide-static-svg = "1.61"
 mdns-sd = "0.21"
 open = "5"
 rfd = "0.17"
 rsa = "0.9"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sys-locale = "0.3.2"
 tar = "0.4"
-tokio = { version = "1", features = ["time", "macros", "rt", "net"] }
+tokio = { version = "1", features = ["time", "macros", "rt", "net", "sync"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "__rustls-tls"] }
 ureq = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# adb_client with fixes for stale messages between commands (see
+# vendor/adb_client/PATCHES.md); drop this once they're upstream.
+[patch.crates-io]
+adb_client = { path = "vendor/adb_client" }
 
 [build-dependencies]
 winresource = "0.1"

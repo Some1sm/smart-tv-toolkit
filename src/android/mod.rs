@@ -1,18 +1,26 @@
 //! Android TV / Google TV support, over ADB.
 
 pub mod actions;
+pub mod bloat;
+pub mod changes;
 pub mod catalog;
 pub mod files;
 pub mod health;
 pub mod install;
 pub mod keyboard;
 pub mod labels;
+pub mod logs;
 pub mod media;
+pub mod optimize;
 pub mod packages;
 pub mod pairing;
+pub mod processes;
 pub mod remote;
+pub mod settings_catalog;
 pub mod shizuku;
 pub mod sysinfo;
+pub mod telemetry;
+pub mod tuneup;
 pub mod transport;
 
 pub use transport::Connection;
@@ -220,6 +228,60 @@ mod tests {
             let size = session.conn.file_size("/system/build.prop".into()).await;
             println!("build.prop size: {size:?}");
             assert!(size.is_some_and(|s| s > 0));
+        });
+    }
+
+    /// Dev helper: run one command on a real TV and print the output.
+    /// Only for read-only commands: `STT_TEST_TV=ip:port STT_TEST_CMD="ps -A"
+    /// cargo test live_shell -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_shell() {
+        let serial = std::env::var("STT_TEST_TV").expect("set STT_TEST_TV=ip:port");
+        let cmd = std::env::var("STT_TEST_CMD").expect("set STT_TEST_CMD");
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let conn = transport::connect(serial).await.expect("connect");
+            let t = std::time::Instant::now();
+            let out = conn.shell(cmd, std::time::Duration::from_secs(60)).await;
+            println!("--- {:?}
+{}", t.elapsed(), out.unwrap_or_else(|e| format!("error: {e}")));
+        });
+    }
+
+    /// Read-only stress test: the Optimize tab's reads back to back on one
+    /// connection, counting failures.
+    /// `STT_TEST_TV=ip:port cargo test live_stale_messages -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_stale_messages() {
+        let serial = std::env::var("STT_TEST_TV").expect("set STT_TEST_TV=ip:port");
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let conn = transport::connect(serial).await.expect("connect");
+            let commands = [
+                "cmd package query-receivers --brief -a android.intent.action.BOOT_COMPLETED",
+                "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.HOME",
+                "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME",
+                "device_config get activity_manager max_cached_processes",
+                "settings get global private_dns_mode",
+                "settings get global private_dns_specifier",
+                "head -n1 /proc/stat",
+            ];
+            let (mut ok, mut failed) = (0, Vec::new());
+            let t = std::time::Instant::now();
+            for round in 0..40 {
+                for cmd in commands {
+                    match conn.shell(cmd, std::time::Duration::from_secs(20)).await {
+                        Ok(_) => ok += 1,
+                        Err(e) => failed.push(format!("round {round} `{cmd}`: {e}")),
+                    }
+                }
+            }
+            println!("{ok} ok, {} failed in {:?}", failed.len(), t.elapsed());
+            for f in failed.iter().take(10) {
+                println!("  {f}");
+            }
         });
     }
 

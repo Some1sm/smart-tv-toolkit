@@ -219,6 +219,42 @@ fn download(url: &str, dest: &Path, progress: &Progress) -> Result<u64, String> 
     Ok(size)
 }
 
+/// The Android package id of a catalog app, where it's known for sure
+/// (used to spot installed copies and offer updates).
+pub fn package_id(spec: &AppSpec) -> Option<&'static str> {
+    Some(match spec.slug {
+        "aurora_store" => "com.aurora.store",
+        "localsend" => "org.localsend.localsend_app",
+        "matvt" => "io.github.virresh.matvt",
+        "smarttube_stable" => "com.teamsmart.videomanager.tv",
+        "shizuku" => "moe.shizuku.privileged.api",
+        _ => return None,
+    })
+}
+
+/// The newest release tag of `spec` (network only, nothing downloaded).
+pub async fn latest_version(spec: AppSpec) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || resolve(&spec, None).map(|(_, tag)| tag.trim_start_matches('v').to_owned()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Installed versions of the catalog apps on the TV (read-only):
+/// `{package: versionName}`.
+pub async fn installed_versions(conn: super::Connection) -> std::collections::HashMap<String, String> {
+    let packages: Vec<&str> = APPS.iter().chain([&SHIZUKU]).filter_map(package_id).collect();
+    let script: String = packages
+        .iter()
+        .map(|p| format!("echo @@{p}; dumpsys package {p} 2>/dev/null | grep -m1 versionName; "))
+        .collect();
+    let out = conn.shell(script, std::time::Duration::from_secs(30)).await.unwrap_or_default();
+    super::sysinfo::split_sections(&out)
+        .into_iter()
+        .filter_map(|(p, v)| Some((p, v.trim().strip_prefix("versionName=")?.trim().to_owned())))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
 /// Resolve and download the right build of `spec` for a TV with `abis`.
 pub async fn fetch(spec: AppSpec, abis: Vec<String>, progress: Progress) -> Result<String, String> {
     let (token, _, note) = build_for(&spec, &abis)?;

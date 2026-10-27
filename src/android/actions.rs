@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::Connection;
+use super::changes::{self, Outcome};
 use super::sysinfo::split_sections;
+use crate::journal::Change;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -177,13 +179,58 @@ impl Action {
         }
     }
 
+    /// Settings actions as `(namespace, key, value)`, so they go through
+    /// [`changes::put_setting`] and can be undone.
+    fn setting(&self) -> Option<(&'static str, &'static str, String)> {
+        let flag = |on: &bool| u8::from(*on).to_string();
+        Some(match self {
+            Action::Rotation(v) => ("system", "user_rotation", (*v).to_owned()),
+            Action::ScreenTimeout(ms) => ("system", "screen_off_timeout", (*ms).to_owned()),
+            Action::DeveloperOptions(on) => ("global", "development_settings_enabled", flag(on)),
+            Action::Location(on) => ("secure", "location_mode", if *on { "3" } else { "0" }.to_owned()),
+            Action::PlayProtect(on) => ("global", "package_verifier_enable", flag(on)),
+            Action::AmbientDisplay(on) => ("secure", "doze_enabled", flag(on)),
+            Action::RepairNtp => ("global", "ntp_server", "pool.ntp.org".to_owned()),
+            _ => return None,
+        })
+    }
+
     pub fn is_reboot(&self) -> bool {
         matches!(self, Action::Reboot | Action::RebootRecovery)
     }
 }
 
-/// Run one action; returns a line (or the command's output) for the log.
-pub async fn run(conn: Connection, action: Action) -> Result<String, String> {
+/// Run one action: a line (or the command's output) for the log, and the
+/// changes made.
+pub async fn run(conn: Connection, action: Action) -> Result<Outcome, String> {
+    if let Some((namespace, key, value)) = action.setting() {
+        let change = changes::put_setting(&conn, namespace, key, Some(&value)).await?;
+        if action == Action::RepairNtp {
+            let _ = conn.shell("am broadcast -a android.intent.action.TIME_TICK", Duration::from_secs(15)).await;
+        }
+        return Ok(Outcome { lines: vec![action.done()], changes: vec![change] });
+    }
+    match action {
+        Action::Density(d) => {
+            let change = changes::set_density(&conn, Some(d)).await?;
+            return Ok(Outcome { lines: vec![action.done()], changes: vec![change] });
+        }
+        Action::ResetDensity => {
+            let change = changes::set_density(&conn, None).await?;
+            return Ok(Outcome { lines: vec![action.done()], changes: vec![change] });
+        }
+        _ => {}
+    }
+    let note = match &action {
+        Action::Console(c) => Some(Change::Note { text: format!("Ran on the TV: {}", console_command(c)) }),
+        _ => None,
+    };
+    let line = run_command(conn, action).await?;
+    Ok(Outcome { lines: vec![line], changes: note.into_iter().collect() })
+}
+
+/// Actions that don't change a setting, run as their command.
+async fn run_command(conn: Connection, action: Action) -> Result<String, String> {
     let cmd = action.command();
     if cmd.is_empty() {
         return Err(match action {

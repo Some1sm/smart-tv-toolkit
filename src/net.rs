@@ -35,7 +35,7 @@ pub fn parse_prefix(prefix: &str) -> Option<[u8; 3]> {
 }
 
 /// Try every (ip, port) at once; report which accepted a TCP connection.
-pub async fn probe(targets: Vec<(Ipv4Addr, u16)>, timeout: Duration) -> Vec<(Ipv4Addr, bool)> {
+pub async fn probe(targets: Vec<(Ipv4Addr, u16)>, timeout: Duration) -> Vec<(Ipv4Addr, u16, bool)> {
     let tasks: Vec<_> = targets
         .into_iter()
         .map(|(ip, port)| {
@@ -43,7 +43,7 @@ pub async fn probe(targets: Vec<(Ipv4Addr, u16)>, timeout: Duration) -> Vec<(Ipv
                 let open = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((ip, port)))
                     .await
                     .is_ok_and(|r| r.is_ok());
-                (ip, open)
+                (ip, port, open)
             })
         })
         .collect();
@@ -56,6 +56,42 @@ pub async fn probe(targets: Vec<(Ipv4Addr, u16)>, timeout: Duration) -> Vec<(Ipv
     results
 }
 
+/// Parse `aa:bb:cc:dd:ee:ff` (or with dashes).
+pub fn parse_mac(mac: &str) -> Option<[u8; 6]> {
+    let parts: Vec<u8> = mac.trim().split([':', '-']).map(|p| u8::from_str_radix(p, 16)).collect::<Result<_, _>>().ok()?;
+    parts.try_into().ok()
+}
+
+/// A Wake-on-LAN "magic packet": six 0xFF bytes, then the MAC 16 times.
+pub fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    let mut packet = vec![0xFF; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&mac);
+    }
+    packet
+}
+
+/// Send a magic packet to the whole network (and the TV's /24 broadcast)
+/// on the usual ports. TVs only wake for it when their network standby /
+/// "remote start" option is on, and usually only over Ethernet.
+pub fn wake_on_lan(mac: &str, ip: Option<Ipv4Addr>) -> Result<(), String> {
+    let mac = parse_mac(mac).ok_or_else(|| format!("not a MAC address: {mac}"))?;
+    let packet = magic_packet(mac);
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    socket.set_broadcast(true).map_err(|e| e.to_string())?;
+    let mut targets = vec![Ipv4Addr::BROADCAST];
+    if let Some(ip) = ip {
+        let [a, b, c, _] = ip.octets();
+        targets.push(Ipv4Addr::new(a, b, c, 255));
+    }
+    for target in targets {
+        for port in [9u16, 7] {
+            socket.send_to(&packet, (target, port)).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Every host address of a /24.
 pub fn hosts(prefix: [u8; 3]) -> impl Iterator<Item = Ipv4Addr> {
     (1..=254u8).map(move |host| Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host))
@@ -64,7 +100,7 @@ pub fn hosts(prefix: [u8; 3]) -> impl Iterator<Item = Ipv4Addr> {
 /// Try `port` on every host of a /24 at once; return the ones that accept.
 pub async fn scan(prefix: [u8; 3], port: u16, timeout: Duration) -> Vec<Ipv4Addr> {
     let targets = hosts(prefix).map(|ip| (ip, port)).collect();
-    probe(targets, timeout).await.into_iter().filter_map(|(ip, open)| open.then_some(ip)).collect()
+    probe(targets, timeout).await.into_iter().filter_map(|(ip, _, open)| open.then_some(ip)).collect()
 }
 
 #[cfg(test)]
@@ -83,6 +119,17 @@ mod tests {
         let found = rt.block_on(scan(prefix, 5555, Duration::from_millis(600)));
         println!("found {found:?} in {:?}", start.elapsed());
         assert!(found.contains(&ip));
+    }
+
+    #[test]
+    fn wake_on_lan_packets() {
+        assert_eq!(parse_mac("14:3f:a6:cd:2e:b3"), Some([0x14, 0x3f, 0xa6, 0xcd, 0x2e, 0xb3]));
+        assert_eq!(parse_mac("14-3F-A6-CD-2E-B3"), Some([0x14, 0x3f, 0xa6, 0xcd, 0x2e, 0xb3]));
+        assert_eq!(parse_mac("nope"), None);
+        let p = magic_packet([1, 2, 3, 4, 5, 6]);
+        assert_eq!(p.len(), 102);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

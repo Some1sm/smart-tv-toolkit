@@ -2,12 +2,12 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, image, row, text};
+use iced::widget::{column, container, image, row};
 use iced::{Alignment, Element, Fill, Task};
 
 use super::{Ctx, View};
 use crate::android::{remote, sysinfo};
-use crate::theme;
+use crate::design::{self as ds, style};
 use crate::ui;
 
 #[derive(Debug, Default)]
@@ -72,15 +72,23 @@ impl State {
 
     pub fn view<'a>(&'a self, _v: &View<'a>) -> Element<'a, Msg> {
         let buttons = row![
-            button(text(if self.capturing { "Capturing…" } else { "Take Screenshot" }).size(13))
-                .padding([8, 16])
-                .style(theme::primary_button)
-                .on_press_maybe((!self.capturing).then_some(Msg::Take)),
-            button(text("Save As…").size(13))
-                .padding([8, 16])
-                .style(theme::secondary_button)
-                .on_press_maybe(self.shot.is_some().then_some(Msg::Save)),
-            text(&self.status).size(12).color(theme::TEXT_MUTED),
+            ds::icon_button(
+                Some((ds::Icon::Camera, ds::ACCENT_TEXT)),
+                if self.capturing { "Capturing…" } else { "Take Screenshot" },
+                None,
+                style::primary,
+                32.0,
+                (!self.capturing).then_some(Msg::Take),
+            ),
+            ds::icon_button(
+                Some((ds::Icon::Save, ds::TEXT_SECONDARY)),
+                "Save As…",
+                None,
+                style::standard,
+                32.0,
+                self.shot.is_some().then_some(Msg::Save),
+            ),
+            ds::label(&self.status, ds::TEXT_BASE, ds::TEXT_SECONDARY),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -89,9 +97,9 @@ impl State {
             Some((handle, _)) => image(handle.clone()).content_fit(iced::ContentFit::Contain).width(Fill).height(Fill).into(),
             None => ui::empty_state("No screenshot yet", "Press Take Screenshot to capture what's on the TV."),
         };
-        column![buttons, container(view).padding(8).width(Fill).height(Fill).style(theme::panel)]
-            .spacing(8)
-            .padding(4)
+        column![buttons, container(view).padding(8).width(Fill).height(Fill).style(style::section)]
+            .spacing(12)
+            .padding(16)
             .into()
     }
 }

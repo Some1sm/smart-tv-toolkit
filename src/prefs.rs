@@ -21,6 +21,10 @@ pub struct Prefs {
     pub scrcpy: Option<PathBuf>,
     /// Date (YYYY-MM-DD) of the last check for a newer app version.
     pub last_update_check: Option<String>,
+    /// Interface zoom on top of the Windows/macOS display scale (1.0 = 100%).
+    pub zoom: f32,
+    /// Interface language code (`en`, `es`); unset follows the computer.
+    pub language: Option<String>,
 }
 
 impl Default for Prefs {
@@ -34,6 +38,8 @@ impl Default for Prefs {
             window_height: None,
             scrcpy: None,
             last_update_check: None,
+            zoom: 1.0,
+            language: None,
         }
     }
 }

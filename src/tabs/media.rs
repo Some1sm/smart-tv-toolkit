@@ -2,14 +2,15 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text_input};
 use iced::{Alignment, Element, Fill, Task};
 
 use super::{Ctx, Event, View};
+use crate::ui::text;
 use crate::android::{files, media};
 use crate::jobs::{JobId, Unit};
 use crate::prefs::Prefs;
-use crate::theme;
+use crate::design::{self as ds, style};
 use crate::{scrcpy, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,6 +23,7 @@ enum Recording {
 
 #[derive(Debug)]
 pub struct State {
+    play_url: String,
     scrcpy: Option<PathBuf>,
     scrcpy_version: Option<String>,
     downloading_scrcpy: bool,
@@ -59,6 +61,12 @@ pub enum Msg {
     Send,
     SendFile(Option<PathBuf>),
     Done(JobId, Result<Vec<String>, String>),
+    PlayUrl(String),
+    Play,
+    PlayFile,
+    PlayFilePicked(Option<PathBuf>),
+    Played(Result<String, String>),
+    PlayedFile(JobId, Result<Result<String, String>, String>),
 }
 
 const START_DIR: &str = "/sdcard/";
@@ -71,6 +79,7 @@ impl State {
             None => Task::none(),
         };
         let state = State {
+            play_url: String::new(),
             scrcpy,
             scrcpy_version: None,
             downloading_scrcpy: false,
@@ -237,6 +246,33 @@ impl State {
                 }
                 return self.list(self.cwd.clone(), ctx);
             }
+            Msg::PlayUrl(u) => self.play_url = u,
+            Msg::Play => {
+                let Some(conn) = ctx.conn() else { return Task::none() };
+                let url = self.play_url.trim().to_owned();
+                if url.is_empty() {
+                    return Task::none();
+                }
+                return Task::perform(crate::android::logs::play(conn, url), Msg::Played);
+            }
+            Msg::PlayFile => {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Play a file on the TV")
+                    .add_filter("Media", &["mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3", "flac", "m4a", "jpg", "jpeg", "png"]);
+                return Task::perform(async move { dialog.pick_file().await.map(|f| f.path().to_path_buf()) }, Msg::PlayFilePicked);
+            }
+            Msg::PlayFilePicked(None) => {}
+            Msg::PlayFilePicked(Some(path)) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.busy = true;
+                return ctx.job(format!("Sending {name}"), Unit::Bytes, move |conn, p| crate::android::logs::send_and_play(conn, path, p), Msg::PlayedFile);
+            }
+            Msg::Played(result) => ctx.log(result.unwrap_or_else(|e| format!("Couldn't play it: {e}"))),
+            Msg::PlayedFile(id, result) => {
+                ctx.jobs.finish(id);
+                self.busy = false;
+                ctx.log(result.and_then(|r| r).unwrap_or_else(|e| format!("Couldn't play it: {e}")));
+            }
         }
         Task::none()
     }
@@ -252,17 +288,17 @@ impl State {
             column![
                 text("Shows the TV's screen in a window on your computer, with mouse and keyboard control.")
                     .size(12)
-                    .color(theme::TEXT_MUTED),
-                text(where_).size(11).color(if self.scrcpy.is_some() { theme::TEXT_DISABLED } else { theme::WARNING }),
+                    .color(ds::TEXT_SECONDARY),
+                text(where_).size(11).color(if self.scrcpy.is_some() { ds::TEXT_TERTIARY } else { ds::AMBER }),
                 row![
-                    ui::small_button("Launch scrcpy", theme::primary_button, self.scrcpy.is_some().then_some(Msg::LaunchScrcpy)),
-                    ui::small_button("Locate…", theme::secondary_button, Some(Msg::LocateScrcpy)),
+                    ui::small_button("Launch scrcpy", style::primary, self.scrcpy.is_some().then_some(Msg::LaunchScrcpy)),
+                    ui::small_button("Locate…", style::standard, Some(Msg::LocateScrcpy)),
                     ui::small_button(
                         if self.downloading_scrcpy { "Downloading…" } else if self.scrcpy.is_some() { "Update" } else { "Download" },
-                        theme::secondary_button,
+                        style::standard,
                         (!self.downloading_scrcpy).then_some(Msg::DownloadScrcpy),
                     ),
-                    ui::small_button("Website", theme::secondary_button, Some(Msg::OpenUrl("https://github.com/Genymobile/scrcpy"))),
+                    ui::small_button("Website", style::standard, Some(Msg::OpenUrl("https://github.com/Genymobile/scrcpy"))),
                 ]
                 .spacing(6),
             ]
@@ -271,17 +307,17 @@ impl State {
         );
 
         let (status, color) = match self.recording {
-            Recording::Idle => ("Not recording. Recordings stop by themselves after 3 minutes.", theme::TEXT_DISABLED),
-            Recording::Recording => ("● Recording…", theme::DANGER),
-            Recording::Stopping => ("Finishing the file…", theme::WARNING),
+            Recording::Idle => ("Not recording. Recordings stop by themselves after 3 minutes.", ds::TEXT_TERTIARY),
+            Recording::Recording => ("● Recording…", ds::RED),
+            Recording::Stopping => ("Finishing the file…", ds::AMBER),
         };
         let recording = ui::card(
             "Screen Recording",
             column![
                 text(status).size(12).color(color),
                 row![
-                    ui::small_button("Start Recording", theme::primary_button, (self.recording == Recording::Idle).then_some(Msg::RecordStart)),
-                    ui::small_button("Stop & Save", theme::danger_button, (self.recording == Recording::Recording).then_some(Msg::RecordStop)),
+                    ui::small_button("Start Recording", style::primary, (self.recording == Recording::Idle).then_some(Msg::RecordStart)),
+                    ui::small_button("Stop & Save", style::danger, (self.recording == Recording::Recording).then_some(Msg::RecordStop)),
                 ]
                 .spacing(6),
             ]
@@ -290,25 +326,25 @@ impl State {
         );
 
         let nav = row![
-            text_input("/sdcard/", &self.path_input).on_input(Msg::PathInput).on_submit(Msg::Go).size(12),
-            ui::small_button("Go", theme::secondary_button, Some(Msg::Go)),
-            ui::small_button("Up", theme::secondary_button, (self.cwd != "/").then_some(Msg::Up)),
-            ui::small_button("↻", theme::secondary_button, Some(Msg::Refresh)),
+            text_input("/sdcard/", &self.path_input).on_input(Msg::PathInput).on_submit(Msg::Go).size(ds::TEXT_BASE).padding([5, 8]).style(style::input(ds::INSET)),
+            ui::small_button("Go", style::standard, Some(Msg::Go)),
+            ui::small_button("Up", style::standard, (self.cwd != "/").then_some(Msg::Up)),
+            ui::small_button("↻", style::standard, Some(Msg::Refresh)),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
         let listing: Element<'a, Msg> = match &self.entries {
-            None => text("Loading…").size(12).color(theme::TEXT_MUTED).into(),
-            Some(Err(e)) => text(e.as_str()).size(12).color(theme::DANGER).into(),
-            Some(Ok(list)) if list.is_empty() => text("(empty folder)").size(12).color(theme::TEXT_DISABLED).into(),
+            None => text("Loading…").size(12).color(ds::TEXT_SECONDARY).into(),
+            Some(Err(e)) => text(e.as_str()).size(12).color(ds::RED).into(),
+            Some(Ok(list)) if list.is_empty() => text("(empty folder)").size(12).color(ds::TEXT_TERTIARY).into(),
             Some(Ok(list)) => column(list.iter().map(|e| {
                 let full = format!("{}{}", self.cwd, e.name);
                 let selected = self.selected.as_deref() == Some(full.as_str());
                 let label = if e.is_dir { format!("📁 {}/", e.name) } else { e.name.clone() };
-                button(text(label).size(12).color(if e.is_dir { theme::PRIMARY } else { theme::TEXT }))
+                button(text(label).size(12).color(if e.is_dir { ds::ACCENT } else { ds::TEXT }))
                     .padding([3, 10])
                     .width(Fill)
-                    .style(theme::tab_button(selected))
+                    .style(style::pill(selected))
                     .on_press(Msg::Clicked(e.name.clone(), e.is_dir))
                     .into()
             }))
@@ -320,13 +356,13 @@ impl State {
             "Files on the TV",
             column![
                 nav,
-                container(scrollable(listing).height(260)).padding(6).width(Fill).style(theme::log_box),
+                container(scrollable(listing).height(260).direction(ds::thin_scrollbar()).style(style::scrollbar)).padding(6).width(Fill).style(style::inset),
                 text(format!("Selected: {target}  (click a file to select it; with nothing selected, the whole folder)"))
                     .size(11)
-                    .color(theme::TEXT_MUTED),
+                    .color(ds::TEXT_SECONDARY),
                 row![
-                    ui::small_button("Download to PC…", theme::primary_button, (!self.busy).then_some(Msg::Download)),
-                    ui::small_button("Send file here…", theme::secondary_button, (!self.busy).then_some(Msg::Send)),
+                    ui::small_button("Download to PC…", style::primary, (!self.busy).then_some(Msg::Download)),
+                    ui::small_button("Send file here…", style::standard, (!self.busy).then_some(Msg::Send)),
                 ]
                 .spacing(6),
             ]
@@ -334,6 +370,26 @@ impl State {
             .into(),
         );
 
-        scrollable(column![scrcpy, recording, files].spacing(8).padding(4)).into()
+        let play = ui::card(
+            "Play on TV",
+            column![
+                ds::label(
+                    "Opens a video, music or picture link in the TV's player, or sends a file from this computer to the TV's \
+                     Movies folder and plays it.",
+                    ds::TEXT_SM,
+                    ds::TEXT_SECONDARY,
+                ),
+                row![
+                    ds::input("https://…/video.mp4", &self.play_url, true, ds::INSET).on_input(Msg::PlayUrl).on_submit(Msg::Play),
+                    ui::small_button("Play Link", style::primary, (!self.play_url.trim().is_empty()).then_some(Msg::Play)),
+                    ui::small_button("Send & Play File…", style::standard, (!self.busy).then_some(Msg::PlayFile)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(8)
+            .into(),
+        );
+        ui::page(column![scrcpy, play, recording, files].spacing(12))
     }
 }

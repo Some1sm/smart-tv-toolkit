@@ -1,18 +1,23 @@
 //! The sidebar: finding TVs (scan, mDNS, history) and connecting to one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, rule, scrollable, space, text, text_input};
-use iced::{Alignment, Element, Fill, Task};
+use iced::widget::{Space, button, checkbox, column, container, hover, progress_bar, row, scrollable, space};
+use iced::{Alignment, Color, Element, Length, Padding, Task, color};
 
 use crate::devices::{self, Reach};
 use crate::history::{self, History};
 use crate::log::Log;
 use crate::mdns::{self, MdnsDevice};
-use crate::{android, net, theme};
+use crate::android::telemetry;
+use crate::design::{self as ds, alpha, style};
+use crate::platform::Session;
+use crate::i18n::trf;
+use crate::platform::Platform;
+use crate::{android, lg, net, samsung};
 
 /// How long each host gets to answer during a network scan.
 const SCAN_TIMEOUT: Duration = Duration::from_millis(600);
@@ -25,6 +30,12 @@ pub struct State {
     /// IPs where ADB answered, and every IP whose ADB port has been checked.
     open: BTreeSet<Ipv4Addr>,
     checked: BTreeSet<Ipv4Addr>,
+    /// Samsung/LG TVs: IP → the port to connect on.
+    others: BTreeMap<Ipv4Addr, u16>,
+    /// Scans still running (one per port).
+    scans: u8,
+    /// Android TVs that batch actions also run on.
+    pub batch: Vec<crate::tabs::Target>,
     mdns: Vec<MdnsDevice>,
     pub subnet: String,
     scanning: bool,
@@ -33,8 +44,9 @@ pub struct State {
     port: String,
     pub connecting: bool,
     pub hint: Option<String>,
-    /// A newer app release: (version, page URL).
-    pub update_available: Option<(String, String)>,
+    /// A newer app release.
+    pub update_available: Option<crate::update::Release>,
+    pub update_state: UpdateState,
     /// The Android 11+ pairing form.
     pair_open: bool,
     pair_address: String,
@@ -46,8 +58,8 @@ pub struct State {
 pub enum Msg {
     SubnetChanged(String),
     Scan,
-    ScanFinished([u8; 3], Vec<Ipv4Addr>),
-    Probed(Vec<(Ipv4Addr, bool)>),
+    ScanFinished([u8; 3], u16, Vec<Ipv4Addr>),
+    Probed(Vec<(Ipv4Addr, u16, bool)>),
     MdnsFinished(Result<Vec<MdnsDevice>, String>),
     Pick(Ipv4Addr, u16),
     Forget(Ipv4Addr),
@@ -58,6 +70,15 @@ pub enum Msg {
     Connect,
     Disconnect,
     OpenRelease,
+    UpdateNow,
+    Restart,
+    /// Re-check saved TVs and listen for announcements (no full scan).
+    Refresh,
+    Diagnostics,
+    /// Tick or untick a TV (serial, name) for batch actions.
+    ToggleBatch(String, String),
+    /// Send a Wake-on-LAN packet to a saved TV.
+    Wake(Ipv4Addr),
     TogglePair,
     PairAddress(String),
     PairCode(String),
@@ -65,17 +86,45 @@ pub enum Msg {
     Paired(Result<String, String>),
 }
 
-/// What the sidebar asks the app shell to do.
-pub enum Request {
-    Connect(String),
-    Disconnect,
+/// Where an in-app update stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateState {
+    Available,
+    Downloading,
+    /// Installed; a restart switches to it.
+    Ready,
 }
 
-/// The connection line under the Connect button.
-pub enum Status {
-    None,
-    Connected { label: String, detail: String },
-    Reconnecting { label: String },
+/// What the sidebar asks the app shell to do.
+pub enum Request {
+    /// Download and install the available update.
+    Update,
+    /// Start the new version and quit this one.
+    Restart,
+    Connect(String),
+    Disconnect,
+    /// Diagnostics: save the log to a file.
+    SaveLog,
+}
+
+/// Live numbers for the telemetry card, kept by the app shell.
+#[derive(Debug, Clone, Default)]
+pub struct Telemetry {
+    /// CPU busy share 0–1, once two samples exist.
+    pub cpu: Option<f32>,
+    /// "4-core A73 @ 1.8GHz"
+    pub cpu_description: String,
+    pub ram_used: u64,
+    pub ram_total: u64,
+    pub latency_ms: Option<f32>,
+}
+
+/// What the sidebar shows about the connected TV.
+pub struct Context<'a> {
+    pub session: Option<&'a Session>,
+    pub reconnecting: bool,
+    pub telemetry: &'a Telemetry,
+    pub log_lines: usize,
 }
 
 impl State {
@@ -87,6 +136,9 @@ impl State {
             history: history::load(),
             open: BTreeSet::new(),
             checked: BTreeSet::new(),
+            others: BTreeMap::new(),
+            scans: 0,
+            batch: Vec::new(),
             mdns: Vec::new(),
             subnet,
             scanning: false,
@@ -96,6 +148,7 @@ impl State {
             connecting: false,
             hint: None,
             update_available: None,
+            update_state: UpdateState::Available,
             pair_open: false,
             pair_address: String::new(),
             pair_code: String::new(),
@@ -126,6 +179,18 @@ impl State {
         Task::perform(mdns::discover(MDNS_LISTEN), Msg::MdnsFinished)
     }
 
+    /// A Samsung or LG remote-control port answered on `ip`.
+    fn note_remote_api(&mut self, ip: Ipv4Addr, port: u16) {
+        self.checked.insert(ip);
+        let connect_port = match port {
+            samsung::REST_PORT | samsung::PORT => samsung::PORT,
+            // Prefer LG's secure port when both answer.
+            lg::PLAIN_PORT if self.others.get(&ip) == Some(&lg::PORT) => lg::PORT,
+            other => other,
+        };
+        self.others.insert(ip, connect_port);
+    }
+
     fn save_history(&self, log: &mut Log) {
         if let Err(e) = history::save(&self.history) {
             log.push(format!("Could not save device history: {e}"));
@@ -139,15 +204,32 @@ impl State {
         self.port = port.to_owned();
     }
 
+    /// Remember a TV's wired MAC address (for Wake-on-LAN).
+    pub fn remember_mac(&mut self, serial: &str, mac: &str, log: &mut Log) {
+        if history::set_mac(&mut self.history, &crate::journal::device_key(serial), mac) {
+            self.save_history(log);
+        }
+    }
+
     /// A TV connected: remember it.
     pub fn connected(&mut self, serial: &str, label: &str, log: &mut Log) {
+        // The connected TV gets every action anyway.
+        let ip = crate::journal::device_key(serial);
+        self.batch.retain(|t| crate::journal::device_key(&t.serial) != ip);
         self.connecting = false;
         self.hint = None;
         if let Some((ip, port)) = serial.rsplit_once(':') {
             history::remember(&mut self.history, ip, port.parse().unwrap_or(android::ADB_PORT), label);
             self.save_history(log);
             if let Ok(ip) = ip.parse() {
-                self.open.insert(ip);
+                match port.parse().map(Platform::for_port) {
+                    Ok(Platform::AndroidTv) | Err(_) => {
+                        self.open.insert(ip);
+                    }
+                    Ok(_) => {
+                        self.others.insert(ip, port.parse().unwrap_or(samsung::PORT));
+                    }
+                }
                 self.checked.insert(ip);
             }
         }
@@ -164,35 +246,63 @@ impl State {
                 let [a, b, c] = prefix;
                 log.push(format!("Scanning {a}.{b}.{c}.1–254 and listening for TVs…"));
                 self.scanning = true;
-                let scan = Task::perform(net::scan(prefix, android::ADB_PORT, SCAN_TIMEOUT), move |found| {
-                    Msg::ScanFinished(prefix, found)
+                // ADB, Samsung's REST port and both LG ports, all at once.
+                let ports = [android::ADB_PORT, samsung::REST_PORT, lg::PORT, lg::PLAIN_PORT];
+                self.scans = ports.len() as u8;
+                let scans = ports.map(|port| {
+                    Task::perform(net::scan(prefix, port, SCAN_TIMEOUT), move |found| Msg::ScanFinished(prefix, port, found))
                 });
-                return (Task::batch([scan, self.listen()]), None);
+                return (Task::batch(scans.into_iter().chain([self.listen()])), None);
             }
-            Msg::ScanFinished(prefix, found) => {
-                self.scanning = false;
-                for ip in net::hosts(prefix) {
-                    self.checked.insert(ip);
-                    self.open.remove(&ip);
-                }
-                log.push(match found.len() {
-                    0 => "Scan: no devices with ADB open.".to_owned(),
-                    n => format!("Scan: {n} device(s) with ADB open."),
-                });
-                self.open.extend(found);
-            }
-            Msg::Probed(results) => {
-                let up = results.iter().filter(|(_, open)| *open).count();
-                let total = results.len();
-                for (ip, open) in results {
-                    self.checked.insert(ip);
-                    if open {
-                        self.open.insert(ip);
-                    } else {
-                        self.open.remove(&ip);
+            Msg::ScanFinished(prefix, port, found) => {
+                self.scans = self.scans.saturating_sub(1);
+                self.scanning = self.scans > 0;
+                match Platform::for_port(port) {
+                    Platform::AndroidTv => {
+                        for ip in net::hosts(prefix) {
+                            self.checked.insert(ip);
+                            self.open.remove(&ip);
+                        }
+                        log.push(match found.len() {
+                            0 => "Scan: no devices with ADB open.".to_owned(),
+                            n => format!("Scan: {n} device(s) with ADB open."),
+                        });
+                        self.open.extend(found);
+                    }
+                    platform => {
+                        if !found.is_empty() {
+                            log.push(format!("Scan: {} {} TV(s).", found.len(), platform.name()));
+                        }
+                        for ip in found {
+                            self.note_remote_api(ip, port);
+                        }
                     }
                 }
-                log.push(format!("Checked {total} device(s): {up} with ADB open."));
+            }
+            Msg::Probed(results) => {
+                let adb: Vec<_> = results.iter().filter(|(_, port, _)| Platform::for_port(*port) == Platform::AndroidTv).collect();
+                let up = adb.iter().filter(|(_, _, open)| *open).count();
+                let total = adb.len();
+                for (ip, port, open) in results {
+                    match Platform::for_port(port) {
+                        Platform::AndroidTv => {
+                            self.checked.insert(ip);
+                            if open {
+                                self.open.insert(ip);
+                            } else {
+                                self.open.remove(&ip);
+                            }
+                        }
+                        _ if open => self.note_remote_api(ip, port),
+                        _ => {
+                            self.checked.insert(ip);
+                            self.others.remove(&ip);
+                        }
+                    }
+                }
+                if total > 0 {
+                    log.push(format!("Checked {total} device(s): {up} with ADB open."));
+                }
             }
             Msg::MdnsFinished(result) => {
                 self.listening = false;
@@ -260,6 +370,26 @@ impl State {
                 return (Task::none(), Some(Request::Connect(android::serial_for(&self.ip, &self.port))));
             }
             Msg::Disconnect => return (Task::none(), Some(Request::Disconnect)),
+            Msg::Refresh => {
+                log.push("Refreshing devices…");
+                return (Task::batch([self.probe_saved(), self.listen()]), None);
+            }
+            Msg::Diagnostics => return (Task::none(), Some(Request::SaveLog)),
+            Msg::Wake(ip) => match history::mac(&self.history, &ip.to_string()) {
+                Some(mac) => log.push(match net::wake_on_lan(&mac, Some(ip)) {
+                    Ok(()) => format!("Sent Wake-on-LAN to {mac}. If the TV allows it, it turns on in a few seconds; then Connect."),
+                    Err(e) => format!("Couldn't send Wake-on-LAN: {e}"),
+                }),
+                None => log.push("This TV's network address isn't known yet; connect to it once while it's on."),
+            },
+            Msg::ToggleBatch(serial, label) => {
+                if let Some(i) = self.batch.iter().position(|t| t.serial == serial) {
+                    self.batch.remove(i);
+                } else {
+                    log.push(format!("{label} will also get Packages and Install actions."));
+                    self.batch.push(crate::tabs::Target { serial, label });
+                }
+            }
             Msg::TogglePair => {
                 self.pair_open = !self.pair_open;
                 if self.pair_open && self.pair_address.is_empty() && !self.ip.trim().is_empty() {
@@ -311,169 +441,375 @@ impl State {
                 }
             }
             Msg::OpenRelease => {
-                if let Some((_, url)) = &self.update_available
-                    && let Err(e) = open::that(url)
+                if let Some(release) = &self.update_available
+                    && let Err(e) = open::that(&release.page)
                 {
                     log.push(format!("Could not open the browser: {e}"));
                 }
             }
+            Msg::UpdateNow => return (Task::none(), Some(Request::Update)),
+            Msg::Restart => return (Task::none(), Some(Request::Restart)),
         }
         (Task::none(), None)
+    }
+}
+
+impl State {
+    fn header(&self, connected: usize, listed: usize) -> Element<'_, Msg> {
+        let busy = self.scanning || self.listening;
+        let title = row![
+            ds::overline("Target Devices"),
+            ds::tinted_badge(format!("{connected}/{listed}"), ds::ACCENT),
+            space::horizontal(),
+            ds::square_button(ds::Icon::RefreshCw, ds::TEXT_SECONDARY, 24.0, style::ghost, (!busy).then_some(Msg::Refresh)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let scan = row![
+            ds::input("192.168.1.0/24", &self.subnet, true, color!(0x181818)).on_input(Msg::SubnetChanged).on_submit(Msg::Scan),
+            ds::icon_button(
+                Some((ds::Icon::Scan, ds::TEXT_SECONDARY)),
+                if self.scanning { "Scanning…" } else { "Scan" },
+                None,
+                style::standard,
+                ds::CONTROL_HEIGHT,
+                (!self.scanning).then_some(Msg::Scan),
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        container(column![title, scan].spacing(8)).padding(12).into()
+    }
+
+    /// The connected TV's card: accent pill, green dot, details, ✕ on hover.
+    fn connected_card<'a>(&'a self, session: &'a Session, reconnecting: bool) -> Element<'a, Msg> {
+        let label = session.label();
+        let (tag, line) = match session.android() {
+            Some(s) => {
+                // The shared platform name ("BRAVIA 4K VH2") next to the retail model.
+                let tag = if s.summary.model != label { s.summary.model.clone() } else { String::new() };
+                (tag, format!("Android {} · API {} · {}", s.summary.android_version, s.summary.sdk, s.summary.abi))
+            }
+            None => (String::new(), session.platform().name().to_owned()),
+        };
+        let (line, line_color) =
+            if reconnecting { ("Connection lost · reconnecting…".to_owned(), ds::AMBER) } else { (line, ds::TEXT_TERTIARY) };
+        let details = column![
+            row![ds::medium(label, ds::TEXT_BASE, ds::TEXT), ds::mono(tag, ds::TEXT_XS, ds::TEXT_TERTIARY)]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            ds::mono(session.address().to_owned(), ds::TEXT_SM, ds::TEXT_SECONDARY),
+            ds::label(line, ds::TEXT_XS, line_color),
+        ]
+        .spacing(2);
+        let pill = container(container(Space::new()).width(3).height(Length::Fill).style(style::accent_bar))
+            .padding(Padding::default().top(8).bottom(8))
+            .height(Length::Fill);
+        let body = row![container(ds::dot(if reconnecting { ds::AMBER } else { ds::GREEN }, 8.0)).padding(Padding::default().top(4)), details]
+            .spacing(8)
+            .padding(Padding { top: 10.0, right: 10.0, bottom: 10.0, left: 7.0 });
+        let base = container(row![pill, body]).width(Length::Fill).style(style::panel(ds::CARD, ds::BORDER, ds::RADIUS));
+        let close = container(ds::square_button(ds::Icon::X, ds::TEXT_SECONDARY, 22.0, style::ghost, Some(Msg::Disconnect)))
+            .align_right(Length::Fill)
+            .padding(6);
+        hover(base, close)
+    }
+
+    fn device_row<'a>(&'a self, e: devices::Entry) -> Element<'a, Msg> {
+        let dot = match e.reach {
+            Reach::Ready => ds::GREEN,
+            Reach::DebuggingOff | Reach::NeedsPairing => alpha(ds::AMBER, 0.8),
+            Reach::Offline | Reach::Unknown => ds::TEXT_TERTIARY,
+        };
+        let serial = format!("{}:{}", e.ip, e.port);
+        let mut details = column![
+            ds::medium(e.title.clone(), ds::TEXT_BASE, ds::TEXT),
+            ds::mono(serial.clone(), ds::TEXT_SM, ds::TEXT_SECONDARY),
+            ds::label(e.status.clone(), ds::TEXT_XS, ds::TEXT_TERTIARY),
+        ]
+        .spacing(2);
+        // Ready Android TVs can join batch actions.
+        if e.reach == Reach::Ready && Platform::for_port(e.port) == Platform::AndroidTv {
+            let ticked = self.batch.iter().any(|t| t.serial == serial);
+            let (s, title) = (serial.clone(), e.title.clone());
+            details = details.push(
+                checkbox(ticked)
+                    .label("Include in batch actions")
+                    .on_toggle(move |_| Msg::ToggleBatch(s.clone(), title.clone()))
+                    .size(12)
+                    .text_size(ds::TEXT_XS)
+                    .style(style::checkbox),
+            );
+        }
+        let content = row![container(ds::dot(dot, 8.0)).padding(Padding::default().top(4)), details].spacing(8);
+        let base = button(container(content).padding(Padding::from([10, 12])).width(Length::Fill))
+            .padding(0)
+            .width(Length::Fill)
+            .style(style::row(false))
+            .on_press_maybe((!self.connecting).then_some(Msg::Pick(e.ip, e.port)));
+        let mut actions = row![].spacing(4).align_y(Alignment::Center);
+        // Off TVs we know the MAC of can be woken up.
+        if e.reach != Reach::Ready && history::mac(&self.history, &e.ip.to_string()).is_some() {
+            actions = actions.push(
+                button(ds::label("Wake", ds::TEXT_SM, ds::TEXT)).padding(Padding::from([3, 8])).style(style::standard).on_press(Msg::Wake(e.ip)),
+            );
+        }
+        if e.saved {
+            actions = actions.push(ds::square_button(ds::Icon::X, ds::TEXT_TERTIARY, 22.0, style::ghost, Some(Msg::Forget(e.ip))));
+        }
+        actions = actions.push(
+            button(ds::label("Connect", ds::TEXT_SM, ds::TEXT))
+                .padding(Padding::from([3, 8]))
+                .style(style::standard)
+                .on_press_maybe((!self.connecting).then_some(Msg::Pick(e.ip, e.port))),
+        );
+        hover(base, container(actions).align_right(Length::Fill).padding(8))
+    }
+
+    fn telemetry_card<'a>(&'a self, session: &'a Session, t: &'a Telemetry, reconnecting: bool) -> Element<'a, Msg> {
+        let port = session.address().rsplit(':').next().unwrap_or("5555");
+        let badge = if reconnecting {
+            ds::tinted_badge("Reconnecting", ds::AMBER)
+        } else {
+            ds::tinted_badge(trf("Port {}: Open", &[&port]), ds::GREEN)
+        };
+        let header = row![
+            ds::icon_any(ds::Icon::Activity, 14.0, ds::ACCENT),
+            ds::medium("Live Telemetry", ds::TEXT_SM, ds::TEXT_SECONDARY),
+            space::horizontal(),
+            badge,
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let gauge = |name: &'a str, value: String, color: Color, fraction: f32, note: String| -> Element<'a, Msg> {
+            container(
+                column![
+                    row![ds::label(name, 10.5, ds::TEXT_TERTIARY), space::horizontal(), ds::mono(value, ds::TEXT_BASE, color).font(ds::MONO_MEDIUM)]
+                        .align_y(Alignment::End),
+                    progress_bar(0.0..=1.0, fraction).girth(6).style(style::gauge(color)),
+                    ds::mono(note, ds::TEXT_2XS, ds::TEXT_TERTIARY),
+                ]
+                .spacing(4),
+            )
+            .padding(8)
+            .width(Length::Fill)
+            .style(style::panel(ds::WELL, alpha(ds::BORDER, 0.6), ds::RADIUS))
+            .into()
+        };
+        let cpu = t.cpu.unwrap_or(0.0);
+        let ram = if t.ram_total > 0 { t.ram_used as f32 / t.ram_total as f32 } else { 0.0 };
+        let gauges = row![
+            gauge("CPU", t.cpu.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_else(|| "—".into()), ds::ACCENT, cpu, t.cpu_description.clone()),
+            gauge(
+                "RAM",
+                if t.ram_total > 0 { format!("{} / {} GB", telemetry::gb(t.ram_used), telemetry::gb(t.ram_total)) } else { "—".into() },
+                ds::PURPLE,
+                ram,
+                trf("{}% committed", &[&format!("{:.0}", ram * 100.0)]),
+            ),
+        ]
+        .spacing(8);
+        let footer = row![
+            ds::dot(if reconnecting { ds::AMBER } else { ds::GREEN }, 6.0),
+            ds::mono(t.latency_ms.map(|l| trf("Latency: {} ms", &[&format!("{l:.0}")])).unwrap_or_else(|| crate::i18n::tr("Latency: —").into()), ds::TEXT_XS, ds::TEXT_SECONDARY),
+            space::horizontal(),
+            ds::mono("Debugging authorized", ds::TEXT_XS, ds::TEXT_TERTIARY),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+        container(column![header, gauges, ds::hline(alpha(ds::BORDER_SUBTLE, 0.6)), footer].spacing(8))
+            .padding(10)
+            .style(style::panel(ds::CARD_DIM, ds::BORDER_SUBTLE, ds::RADIUS))
+            .into()
+    }
+
+    fn connect_box<'a>(&'a self, connected: bool) -> Element<'a, Msg> {
+        let title = row![
+            ds::medium("Direct ADB Connect", ds::TEXT_SM, ds::TEXT_SECONDARY),
+            space::horizontal(),
+            ds::mono(Platform::for_port(self.port.trim().parse().unwrap_or(android::ADB_PORT)).name(), ds::TEXT_XS, ds::TEXT_TERTIARY),
+        ];
+        let fields = row![
+            ds::input("Host IP", &self.ip, true, ds::INSET).on_input(Msg::IpChanged).on_submit(Msg::Connect),
+            ds::input("Port", &self.port, true, ds::INSET).on_input(Msg::PortChanged).on_submit(Msg::Connect).width(64),
+        ]
+        .spacing(6);
+        let action: Element<'a, Msg> = if connected {
+            ds::icon_button(Some((ds::Icon::Power, ds::RED)), "Disconnect Session", None, style::danger, ds::CONTROL_HEIGHT, Some(Msg::Disconnect))
+                .width(Length::Fill)
+                .into()
+        } else {
+            ds::icon_button(
+                Some((ds::Icon::Plug, ds::ACCENT_TEXT)),
+                if self.connecting { "Connecting…" } else { "Connect" },
+                None,
+                style::primary,
+                ds::CONTROL_HEIGHT,
+                (!self.connecting).then_some(Msg::Connect),
+            )
+            .width(Length::Fill)
+            .into()
+        };
+        let mut col = column![title, fields, action].spacing(8);
+        if let Some(hint) = &self.hint {
+            col = col.push(ds::label(hint.as_str(), ds::TEXT_SM, ds::AMBER));
+        }
+        let pair_link = button(
+            row![
+                ds::icon_any(ds::Icon::QrCode, 12.0, if self.pair_open { ds::ACCENT } else { ds::TEXT_TERTIARY }),
+                ds::label("Wireless Pairing Code (Android 11+)", ds::TEXT_SM, if self.pair_open { ds::ACCENT } else { ds::TEXT_SECONDARY }),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .padding(0)
+        .style(style::link(ds::ACCENT))
+        .on_press(Msg::TogglePair);
+        col = col.push(container(pair_link).center_x(Length::Fill));
+        if self.pair_open {
+            col = col.push(self.pair_form());
+        }
+        container(col).padding(12).width(Length::Fill).style(style::fill(ds::SIDEBAR_LOW)).into()
     }
 
     /// Android 11+ wireless debugging: pair once with the code on the TV.
     fn pair_form(&self) -> Element<'_, Msg> {
-        let toggle = button(
-            text(if self.pair_open { "▾ Pair with a code (Android 11+)" } else { "▸ Pair with a code (Android 11+)" })
-                .size(11)
-                .color(theme::PRIMARY),
-        )
-        .padding([2, 4])
-        .style(theme::tab_button(false))
-        .on_press(Msg::TogglePair);
-        if !self.pair_open {
-            return toggle.into();
-        }
         let ready = android::pairing::valid_code(&self.pair_code) && !self.pairing;
         column![
-            toggle,
-            text("On the TV: Developer options → Wireless debugging → Pair device with pairing code.")
-                .size(10)
-                .color(theme::TEXT_MUTED),
+            ds::label("On the TV: Developer options → Wireless debugging → Pair device with pairing code.", ds::TEXT_XS, ds::TEXT_TERTIARY),
             row![
-                text_input("IP:pairing port", &self.pair_address).on_input(Msg::PairAddress).size(12),
-                text_input("Code", &self.pair_code).on_input(Msg::PairCode).on_submit(Msg::Pair).size(12).width(70),
+                ds::input("IP:pairing port", &self.pair_address, true, ds::INSET).on_input(Msg::PairAddress),
+                ds::input("Code", &self.pair_code, true, ds::INSET).on_input(Msg::PairCode).on_submit(Msg::Pair).width(72),
             ]
             .spacing(6),
-            button(text(if self.pairing { "Pairing…" } else { "Pair" }).size(12).center().width(Fill))
-                .padding([6, 12])
-                .style(theme::secondary_button)
-                .on_press_maybe(ready.then_some(Msg::Pair)),
+            ds::icon_button(
+                Some((ds::Icon::Link, ds::TEXT_SECONDARY)),
+                if self.pairing { "Pairing…" } else { "Pair" },
+                None,
+                style::standard,
+                ds::CONTROL_HEIGHT,
+                ready.then_some(Msg::Pair),
+            )
+            .width(Length::Fill),
         ]
         .spacing(6)
         .into()
     }
 
-    fn update_notice(&self) -> Element<'_, Msg> {
-        match &self.update_available {
-            Some((version, _)) => button(text(format!("Version {version} is available. Get it…")).size(11).color(theme::PRIMARY))
-                .padding([4, 8])
-                .width(Fill)
-                .style(theme::tab_button(false))
-                .on_press(Msg::OpenRelease)
-                .into(),
-            None => space().into(),
-        }
-    }
-
-    fn device_list(&self, connected_ip: Option<&str>) -> Element<'_, Msg> {
-        let now = chrono::Local::now().naive_local();
-        let entries = devices::merge(&self.history, &self.open, &self.checked, &self.mdns, now);
-        if entries.is_empty() {
-            let hint = if self.scanning || self.listening { "Looking for TVs…" } else { "No devices yet. Press Scan." };
-            return text(hint).size(11).color(theme::TEXT_DISABLED).into();
-        }
-        column(entries.into_iter().map(|e| {
-            let connected = connected_ip == Some(e.ip.to_string().as_str());
-            let dot = match (connected, &e.reach) {
-                (true, _) | (_, Reach::Ready) => theme::SUCCESS,
-                (_, Reach::DebuggingOff | Reach::NeedsPairing) => theme::WARNING,
-                (_, Reach::Offline) => theme::TEXT_DISABLED,
-                (_, Reach::Unknown) => theme::TEXT_MUTED,
-            };
-            let label = row![
-                text("●").size(12).color(dot),
-                column![text(e.title).size(13), text(e.detail).size(10).color(theme::TEXT_MUTED)].spacing(1).width(Fill),
+    fn footer(&self, online: bool, log_lines: usize) -> Element<'_, Msg> {
+        let status = if online { ("Online", ds::GREEN) } else { ("Offline", ds::TEXT_TERTIARY) };
+        let link = |caption: &'static str, msg: Msg| {
+            button(ds::label(caption, ds::TEXT_XS, ds::TEXT_SECONDARY)).padding(0).style(style::link(ds::TEXT)).on_press(msg)
+        };
+        container(
+            column![
+                row![
+                    ds::mono("ADB: built-in (native)", ds::TEXT_XS, ds::TEXT_SECONDARY),
+                    space::horizontal(),
+                    row![ds::dot(status.1, 6.0), ds::mono(status.0, ds::TEXT_XS, status.1)].spacing(4).align_y(Alignment::Center),
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    ds::label(trf("Log: {} lines", &[&log_lines]), ds::TEXT_XS, ds::TEXT_TERTIARY),
+                    space::horizontal(),
+                    link("Import…", Msg::Import),
+                    link("Diagnostics", Msg::Diagnostics),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
             ]
-            .spacing(8)
-            .align_y(Alignment::Center);
-            let pick = button(label)
-                .padding([5, 8])
-                .width(Fill)
-                .style(theme::tab_button(connected))
-                .on_press_maybe((!self.connecting).then_some(Msg::Pick(e.ip, e.port)));
-            let forget: Element<'_, Msg> = if e.saved {
-                button(text("×").size(13)).padding([2, 6]).style(theme::tab_button(false)).on_press(Msg::Forget(e.ip)).into()
-            } else {
-                space().into()
-            };
-            row![pick, forget].spacing(2).align_y(Alignment::Center).into()
-        }))
-        .spacing(2)
+            .spacing(4),
+        )
+        .padding(Padding::from([8, 10]))
+        .width(Length::Fill)
+        .style(style::fill(ds::FOOTER))
         .into()
     }
 
-    pub fn view(&self, status: Status) -> Element<'_, Msg> {
-        let small = |s: &'static str| text(s).size(11).color(theme::TEXT_DISABLED);
-        let busy = self.scanning || self.listening;
-        let scan_row = row![
-            text_input("192.168.1", &self.subnet).on_input(Msg::SubnetChanged).on_submit(Msg::Scan).size(13),
-            button(text(if busy { "Scanning…" } else { "Scan" }).size(13))
-                .padding([6, 12])
-                .style(theme::secondary_button)
-                .on_press_maybe((!self.scanning).then_some(Msg::Scan)),
-        ]
-        .spacing(6);
-
-        let connected = !matches!(status, Status::None);
-        let connect_button = if connected {
-            button(text("Disconnect").center().width(Fill)).style(theme::danger_button).on_press(Msg::Disconnect)
-        } else {
-            let label = if self.connecting { "Connecting…" } else { "Connect" };
-            button(text(label).center().width(Fill))
-                .style(theme::primary_button)
-                .on_press_maybe((!self.connecting).then_some(Msg::Connect))
+    fn update_notice(&self) -> Option<Element<'_, Msg>> {
+        let release = self.update_available.as_ref()?;
+        let (message, actions): (String, Element<'_, Msg>) = match self.update_state {
+            UpdateState::Available => (
+                trf("Version {} is available.", &[&release.version]),
+                row![
+                    ds::icon_button(
+                        Some((ds::Icon::Download, ds::ACCENT_TEXT)),
+                        if release.asset.is_some() { "Update now" } else { "Download" },
+                        None,
+                        style::primary,
+                        24.0,
+                        Some(if release.asset.is_some() { Msg::UpdateNow } else { Msg::OpenRelease }),
+                    ),
+                    button(ds::label("What's new", ds::TEXT_SM, ds::TEXT_SECONDARY)).padding(0).style(style::link(ds::ACCENT)).on_press(Msg::OpenRelease),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into(),
+            ),
+            UpdateState::Downloading => (trf("Downloading version {}…", &[&release.version]), Space::new().into()),
+            UpdateState::Ready => (
+                trf("Version {} is installed.", &[&release.version]),
+                ds::icon_button(Some((ds::Icon::RefreshCw, ds::ACCENT_TEXT)), "Restart now", None, style::primary, 24.0, Some(Msg::Restart))
+                    .into(),
+            ),
         };
-
-        let connected_ip: Option<String> = match &status {
-            Status::Connected { detail, .. } => {
-                detail.rsplit(" · ").next().and_then(|a| a.split(':').next()).map(str::to_owned)
-            }
-            _ => None,
-        };
-        let status_view: Element<'_, Msg> = match status {
-            Status::Connected { label, detail } => column![
-                text(label).size(13).color(theme::SUCCESS),
-                text(detail).size(11).color(theme::TEXT_MUTED),
-            ]
-            .spacing(2)
+        Some(
+            container(
+                container(column![ds::label(message, ds::TEXT_SM, ds::ACCENT), actions].spacing(6))
+                    .padding(Padding::from([8, 10]))
+                    .width(Length::Fill)
+                    .style(style::panel(alpha(ds::ACCENT, 0.08), alpha(ds::ACCENT, 0.3), ds::RADIUS)),
+            )
+            .padding(Padding::from([4, 8]))
             .into(),
-            Status::Reconnecting { label } => column![
-                text(label).size(13).color(theme::WARNING),
-                text("Connection lost. Reconnecting…").size(11).color(theme::WARNING),
-            ]
-            .spacing(2)
-            .into(),
-            Status::None => match &self.hint {
-                Some(hint) => text(hint).size(11).color(theme::WARNING).into(),
-                None => space().into(),
-            },
-        };
+        )
+    }
 
-        let content = column![
-            text("Devices").size(16).color(theme::TEXT),
-            scan_row,
-            scrollable(self.device_list(connected_ip.as_deref())).height(Fill),
-            rule::horizontal(1),
-            small("Connect by IP"),
-            row![
-                text_input("192.168.1.x", &self.ip).on_input(Msg::IpChanged).on_submit(Msg::Connect).size(13),
-                text_input("5555", &self.port).on_input(Msg::PortChanged).on_submit(Msg::Connect).size(13).width(64),
-            ]
-            .spacing(6),
-            connect_button.padding([8, 12]),
-            self.pair_form(),
-            status_view,
-            self.update_notice(),
-            row![
-                small("Built-in ADB: no adb.exe needed.").width(Fill),
-                button(text("Import…").size(11)).padding([2, 6]).style(theme::tab_button(false)).on_press(Msg::Import),
-            ]
-            .align_y(Alignment::Center),
+    pub fn view<'a>(&'a self, cx: Context<'a>) -> Element<'a, Msg> {
+        let now = chrono::Local::now().naive_local();
+        let connected_ip = cx.session.map(|s| s.address().split(':').next().unwrap_or("").to_owned());
+        let entries: Vec<devices::Entry> = devices::merge(&self.history, &self.open, &self.checked, &self.others, &self.mdns, now)
+            .into_iter()
+            .filter(|e| connected_ip.as_deref() != Some(e.ip.to_string().as_str()))
+            .collect();
+        let listed = entries.len() + usize::from(cx.session.is_some());
+
+        let mut list = column![].spacing(4);
+        if let Some(session) = cx.session {
+            list = list.push(self.connected_card(session, cx.reconnecting));
+        }
+        if entries.is_empty() && cx.session.is_none() {
+            let hint = if self.scanning || self.listening { "Looking for TVs…" } else { "No devices yet. Press Scan." };
+            list = list.push(container(ds::label(hint, ds::TEXT_SM, ds::TEXT_TERTIARY)).padding(8));
+        }
+        for e in entries {
+            list = list.push(self.device_row(e));
+        }
+        let mut body = column![list].spacing(8).padding(Padding::from([8, 8]));
+        // Live telemetry needs ADB.
+        if let Some(session) = cx.session.filter(|s| s.android().is_some()) {
+            body = body.push(self.telemetry_card(session, cx.telemetry, cx.reconnecting));
+        }
+
+        let mut col = column![
+            self.header(usize::from(cx.session.is_some()), listed),
+            ds::hline(ds::BORDER_SUBTLE),
+            scrollable(body).height(Length::Fill).direction(ds::thin_scrollbar()).style(style::scrollbar),
+        ];
+        if let Some(notice) = self.update_notice() {
+            col = col.push(notice);
+        }
+        col = col
+            .push(ds::hline(ds::BORDER))
+            .push(self.connect_box(cx.session.is_some()))
+            .push(ds::hline(ds::BORDER))
+            .push(self.footer(cx.session.is_some() && !cx.reconnecting, cx.log_lines));
+
+        row![
+            container(col).width(ds::SIDEBAR_WIDTH).height(Length::Fill).style(style::fill(ds::SIDEBAR)),
+            ds::vline_fill(),
         ]
-        .spacing(10)
-        .padding(14);
-
-        container(content).width(280).height(Fill).style(theme::sidebar).into()
+        .into()
     }
 }

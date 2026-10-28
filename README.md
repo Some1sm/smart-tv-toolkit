@@ -1,19 +1,23 @@
 # Smart TV Toolkit
 
-A desktop app for managing smart TVs from your computer: device info, apps,
-performance tuning, settings and more.
+A desktop app for managing, cleaning up and speeding up smart TVs from your
+computer: apps, storage, background apps, settings, remote control and more,
+with every change recorded so it can be undone.
 
-Built in Rust with [iced](https://iced.rs). A rewrite of
+Built in Rust with [iced](https://iced.rs), in English and Spanish. A rewrite of
 [Android TV Desktop Toolkit](https://github.com/steven-ahfu/Android-TV-Desktop-Toolkit)
 by steven-ahfu (see [NOTICE.md](NOTICE.md)).
 
 ## Platforms
 
-| Platform | Connection | Status |
-|---|---|---|
-| Android TV / Google TV | ADB over the network | Supported |
-| LG webOS | — | Planned |
-| Samsung Tizen | — | Planned |
+| Platform | Connection | Status | Tabs |
+|---|---|---|---|
+| Android TV / Google TV | ADB over the network | Supported | All |
+| Samsung Tizen (2016+) | The TV's remote-control API (ports 8001/8002) | Experimental | Info, Apps, Remote |
+| LG webOS | The LG phone-remote API (ports 3000/3001) | Experimental | Info, Apps, Remote |
+
+Samsung and LG TVs are found by the network scan like Android TVs. Their support
+hasn't been tried on many real TVs yet, so reports are welcome.
 
 ## Download
 
@@ -57,16 +61,56 @@ Android SDK aren't needed.
 - The app remembers the last TV and reconnects on launch, and reconnects by itself
   if the connection drops (e.g. after the TV sleeps).
 
-## Features worth knowing
+## Requirements (Samsung and LG)
 
-- **Packages** shows real app names (read from each APK and cached), not just
-  package ids. For the long system list, use **Load real names**.
+No developer mode needed. Connect to the TV's IP (the scan finds it), and accept
+the prompt that appears on the TV the first time. The TV then hands out a key the
+app saves, so later connections don't ask again. On older LG models, turn on
+**LG Connect Apps** (or **Mobile TV On**) in the TV's network settings.
+
+## Features (Android TV)
+
+- **Optimize**
+  - **Recommended:** safe changes applied together (disable bloatware, faster
+    animations, the app freezer, trim caches, compile apps). The TV is measured
+    and a snapshot saved first, so everything can be put back.
+  - **TV Settings:** apps-only mode, hands-free "Hey Google", app auto-updates, the
+    screen saver and the last restart, each with a button that opens the screen
+    on the TV.
+  - **Storage:** free space, the biggest apps with **Clear Cache** kept apart from
+    **Clear Data** (logins and add-ons survive a cache clear), system app updates
+    you can remove, and large files.
+  - Background apps, start-at-boot apps, the home app, a cached-app limit and
+    ad-blocking Private DNS.
+  - **Before & After:** measure CPU, memory, swap, storage and running apps, and
+    time app launches, before and after optimizing.
+- **Packages:** every app with its real name and icon, a bloatware rating and
+  filter (Bloatware / Optional / Keep), and batch disable, enable, uninstall, clear
+  cache, clear data and force stop.
+- **History:** every change is recorded with **Undo**. A snapshot of the TV's apps
+  and settings is taken each day; restore one, or copy a TV's setup to others.
+- **Batch TVs:** tick other TVs in the sidebar and changes are made on them too.
+- **Performance:** Health Check, running processes and live CPU/RAM.
+- **Settings:** a browser for the TV's settings with plain descriptions, quick
+  toggles, and shortcuts that open settings screens on the TV.
+- **Install:** APKs (several at once), quick-install apps with update checks, and
+  Shizuku.
+- **Remote, Screenshot, Media** (scrcpy mirroring and recording, a file browser,
+  Play on TV), **Tools** (type text, logs, reboot) and **Wake-on-LAN**.
+
+Good to know:
+
+- **Packages** reads real app names from each APK and caches them. For the long
+  system list, use **Load real names**.
 - **Tools → Type text** handles accents and other scripts by installing the small
   ADBKeyboard helper on the TV the first time it's needed.
 - **Media → scrcpy:** point the app at your scrcpy (**Locate…**) or let it download
   the latest release, checked against its published SHA-256 sums.
 - Long jobs (installs, transfers, compiling) run on their own connection and show
   progress at the bottom, so the remote and other tabs keep working meanwhile.
+- App data (history, snapshots, measurements, pairings) lives in
+  `%APPDATA%\SmartTVToolkit` on Windows, `~/Library/Application Support/SmartTVToolkit`
+  on macOS and `~/.config/SmartTVToolkit` on Linux.
 
 ## Building
 
@@ -91,6 +135,7 @@ or **x64 Native Tools** prompt so the MSVC environment is set.
 - Windows: `.\scripts\package-windows.ps1` → `dist\SmartTVToolkit-<version>-windows-x64.zip`
 - macOS: `scripts/bundle-macos.sh` → `dist/SmartTVToolkit-<version>-macos-universal.dmg`
   (needs `rustup target add aarch64-apple-darwin x86_64-apple-darwin`)
+- Linux: `scripts/package-linux.sh` → `dist/SmartTVToolkit-<version>-linux-x86_64.tar.gz`
 - License notices for bundled crates: `cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html`
   (needs `cargo install cargo-about --features cli`); both scripts include the file when present.
 - Icons: `uv run --with pillow python scripts/make_icons.py` regenerates `assets/`.
@@ -107,23 +152,16 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-GitHub Actions builds both packages and creates a **draft** release with them
-attached; check the notes and publish it. Every push to `main` also runs the
-tests on Windows and macOS.
+GitHub Actions builds the Windows, macOS and Linux packages and creates a
+**draft** release with them attached; check the notes and publish it. Every push
+to `main` also runs the tests on Windows, macOS and Linux.
 
-## Roadmap (Android TV parity with the original)
+### Code layout
 
-1. Foundation: window, sidebar and tabs, built-in ADB (no adb.exe), connect by IP ✅
-2. Devices: network scan ✅, mDNS discovery ✅, device history ✅ (imports the original's
-   `devices.json`), Android 11+ pairing ✅
-3. Info tab and Health Check ✅
-4. Packages ✅, Performance ✅, Install ✅, Remote ✅, Screenshot ✅, Settings ✅, Tools ✅,
-   Media (scrcpy, screen recording, file browser) ✅
-5. Packaging: Windows zip, universal macOS app and Linux tarball with icons, license
-   notices, and GitHub Actions for tests and releases ✅
-
-Next: LG webOS and Samsung Tizen. Each platform is a `Session` variant in
-`src/platform.rs` that lists the tabs it supports; tabs live in `src/tabs/`.
+Each platform is a `Session` variant in `src/platform.rs` that lists the tabs it
+supports; tabs live in `src/tabs/`, Android TV work in `src/android/`, and Samsung
+and LG in `src/samsung.rs` and `src/lg.rs`. `vendor/adb_client` is a patched copy
+of the adb_client crate (see its `PATCHES.md`).
 
 ## License
 

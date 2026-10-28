@@ -27,7 +27,7 @@ impl Platform {
 
     /// Tabs this platform supports, in display order.
     pub fn tabs(self) -> &'static [Tab] {
-        const ANDROID: [Tab; 11] = [
+        const ANDROID: [Tab; 12] = [
             Tab::Info,
             Tab::Packages,
             Tab::Performance,
@@ -36,6 +36,7 @@ impl Platform {
             Tab::Settings,
             Tab::Tools,
             Tab::Media,
+            Tab::Files,
             Tab::Remote,
             Tab::Screenshot,
             Tab::History,

@@ -1,13 +1,13 @@
-//! Media: scrcpy, screen recording and the file browser.
+//! Media: scrcpy, screen recording and playing on the TV. (Files are in the Files tab.)
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, text_input};
-use iced::{Alignment, Element, Fill, Task};
+use iced::widget::{column, row};
+use iced::{Alignment, Element, Task};
 
 use super::{Ctx, Event, View};
 use crate::ui::text;
-use crate::android::{files, media};
+use crate::android::media;
 use crate::jobs::{JobId, Unit};
 use crate::prefs::Prefs;
 use crate::design::{self as ds, style};
@@ -28,10 +28,6 @@ pub struct State {
     scrcpy_version: Option<String>,
     downloading_scrcpy: bool,
     recording: Recording,
-    cwd: String,
-    path_input: String,
-    entries: Option<Result<Vec<files::Entry>, String>>,
-    selected: Option<String>,
     busy: bool,
 }
 
@@ -50,17 +46,6 @@ pub enum Msg {
     RecordEnded(Result<(), String>),
     RecordSaveTo(Option<PathBuf>),
     RecordSaved(JobId, Result<Result<String, String>, String>),
-    PathInput(String),
-    Go,
-    Up,
-    Refresh,
-    Listed(String, Result<Vec<files::Entry>, String>),
-    Clicked(String, bool),
-    Download,
-    DownloadTo(Option<PathBuf>),
-    Send,
-    SendFile(Option<PathBuf>),
-    Done(JobId, Result<Vec<String>, String>),
     PlayUrl(String),
     Play,
     PlayFile,
@@ -68,8 +53,6 @@ pub enum Msg {
     Played(Result<String, String>),
     PlayedFile(JobId, Result<Result<String, String>, String>),
 }
-
-const START_DIR: &str = "/sdcard/";
 
 impl State {
     pub fn new(prefs: &Prefs) -> (Self, Task<Msg>) {
@@ -84,10 +67,6 @@ impl State {
             scrcpy_version: None,
             downloading_scrcpy: false,
             recording: Recording::Idle,
-            cwd: START_DIR.into(),
-            path_input: START_DIR.into(),
-            entries: None,
-            selected: None,
             busy: false,
         };
         (state, task)
@@ -95,24 +74,7 @@ impl State {
 
     pub fn reset(&mut self) {
         self.recording = Recording::Idle;
-        self.entries = None;
-        self.selected = None;
         self.busy = false;
-    }
-
-    /// List the TV's files the first time the tab is opened.
-    pub fn on_open(&mut self, ctx: &mut Ctx) -> Task<Msg> {
-        if self.entries.is_none() { self.list(self.cwd.clone(), ctx) } else { Task::none() }
-    }
-
-    fn list(&mut self, dir: String, ctx: &mut Ctx) -> Task<Msg> {
-        let Some(conn) = ctx.conn() else { return Task::none() };
-        let dir = files::as_dir(&dir);
-        self.cwd = dir.clone();
-        self.path_input = dir.clone();
-        self.entries = None;
-        self.selected = None;
-        Task::perform(files::list(conn, dir.clone()), move |r| Msg::Listed(dir.clone(), r))
     }
 
     fn set_scrcpy(&mut self, exe: PathBuf, ctx: &mut Ctx) -> Task<Msg> {
@@ -200,52 +162,6 @@ impl State {
                 self.recording = Recording::Idle;
                 ctx.log(result.and_then(|r| r).unwrap_or_else(|e| format!("Could not save the recording: {e}")));
             }
-            Msg::PathInput(v) => self.path_input = v,
-            Msg::Go => return self.list(self.path_input.clone(), ctx),
-            Msg::Up => return self.list(files::parent(&self.cwd), ctx),
-            Msg::Refresh => return self.list(self.cwd.clone(), ctx),
-            Msg::Listed(dir, result) => {
-                if dir == self.cwd && ctx.session.is_some() {
-                    self.entries = Some(result);
-                }
-            }
-            Msg::Clicked(name, true) => return self.list(format!("{}{name}", self.cwd), ctx),
-            Msg::Clicked(name, false) => {
-                let full = format!("{}{name}", self.cwd);
-                // Clicking the selected file again deselects it (back to the folder).
-                self.selected = if self.selected.as_deref() == Some(full.as_str()) { None } else { Some(full) };
-            }
-            Msg::Download => return Task::perform(ui::pick_folder("Download to folder"), Msg::DownloadTo),
-            Msg::DownloadTo(None) => {}
-            Msg::DownloadTo(Some(dest)) => {
-                let target = self.selected.clone().unwrap_or_else(|| self.cwd.clone());
-                ctx.log(format!("Downloading {target}…"));
-                self.busy = true;
-                let title = format!("Downloading {}", target.trim_end_matches('/').rsplit('/').next().unwrap_or(&target));
-                return ctx.job(title, Unit::Bytes, move |conn, p| files::download(conn, target, dest, p), Msg::Done);
-            }
-            Msg::Send => {
-                let dialog = rfd::AsyncFileDialog::new().set_title("Send a file to the TV");
-                return Task::perform(async move { dialog.pick_file().await.map(|f| f.path().to_path_buf()) }, Msg::SendFile);
-            }
-            Msg::SendFile(None) => {}
-            Msg::SendFile(Some(local)) => {
-                self.busy = true;
-                let dir = self.cwd.clone();
-                let name = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                return ctx.job(format!("Sending {name}"), Unit::Bytes, move |conn, p| files::send(conn, local, dir, p), |id, r| {
-                    Msg::Done(id, r.map(|inner| vec![inner.unwrap_or_else(|e| format!("Send failed: {e}"))]))
-                });
-            }
-            Msg::Done(id, result) => {
-                ctx.jobs.finish(id);
-                self.busy = false;
-                match result {
-                    Ok(lines) => lines.into_iter().for_each(|l| ctx.log(l)),
-                    Err(e) => ctx.log(format!("Failed: {e}")),
-                }
-                return self.list(self.cwd.clone(), ctx);
-            }
             Msg::PlayUrl(u) => self.play_url = u,
             Msg::Play => {
                 let Some(conn) = ctx.conn() else { return Task::none() };
@@ -325,51 +241,6 @@ impl State {
             .into(),
         );
 
-        let nav = row![
-            text_input("/sdcard/", &self.path_input).on_input(Msg::PathInput).on_submit(Msg::Go).size(ds::TEXT_BASE).padding([5, 8]).style(style::input(ds::INSET)),
-            ui::small_button("Go", style::standard, Some(Msg::Go)),
-            ui::small_button("Up", style::standard, (self.cwd != "/").then_some(Msg::Up)),
-            ui::small_button("↻", style::standard, Some(Msg::Refresh)),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        let listing: Element<'a, Msg> = match &self.entries {
-            None => text("Loading…").size(12).color(ds::TEXT_SECONDARY).into(),
-            Some(Err(e)) => text(e.as_str()).size(12).color(ds::RED).into(),
-            Some(Ok(list)) if list.is_empty() => text("(empty folder)").size(12).color(ds::TEXT_TERTIARY).into(),
-            Some(Ok(list)) => column(list.iter().map(|e| {
-                let full = format!("{}{}", self.cwd, e.name);
-                let selected = self.selected.as_deref() == Some(full.as_str());
-                let label = if e.is_dir { format!("📁 {}/", e.name) } else { e.name.clone() };
-                button(text(label).size(12).color(if e.is_dir { ds::ACCENT } else { ds::TEXT }))
-                    .padding([3, 10])
-                    .width(Fill)
-                    .style(style::pill(selected))
-                    .on_press(Msg::Clicked(e.name.clone(), e.is_dir))
-                    .into()
-            }))
-            .spacing(1)
-            .into(),
-        };
-        let target = self.selected.as_deref().unwrap_or(&self.cwd);
-        let files = ui::card(
-            "Files on the TV",
-            column![
-                nav,
-                container(scrollable(listing).height(260).direction(ds::thin_scrollbar()).style(style::scrollbar)).padding(6).width(Fill).style(style::inset),
-                text(format!("Selected: {target}  (click a file to select it; with nothing selected, the whole folder)"))
-                    .size(11)
-                    .color(ds::TEXT_SECONDARY),
-                row![
-                    ui::small_button("Download to PC…", style::primary, (!self.busy).then_some(Msg::Download)),
-                    ui::small_button("Send file here…", style::standard, (!self.busy).then_some(Msg::Send)),
-                ]
-                .spacing(6),
-            ]
-            .spacing(8)
-            .into(),
-        );
-
         let play = ui::card(
             "Play on TV",
             column![
@@ -390,6 +261,6 @@ impl State {
             .spacing(8)
             .into(),
         );
-        ui::page(column![scrcpy, play, recording, files].spacing(12))
+        ui::page(column![scrcpy, play, recording].spacing(12))
     }
 }

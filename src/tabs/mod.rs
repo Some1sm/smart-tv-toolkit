@@ -16,6 +16,7 @@ use crate::platform::Session;
 use crate::prefs::Prefs;
 
 pub mod apps;
+pub mod files;
 pub mod history;
 pub mod info;
 pub mod install;
@@ -39,13 +40,14 @@ pub enum Tab {
     Settings,
     Tools,
     Media,
+    Files,
     Remote,
     Screenshot,
     History,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 12] = [
+    pub const ALL: [Tab; 13] = [
         Tab::Info,
         Tab::Packages,
         Tab::Apps,
@@ -55,6 +57,7 @@ impl Tab {
         Tab::Settings,
         Tab::Tools,
         Tab::Media,
+        Tab::Files,
         Tab::Remote,
         Tab::Screenshot,
         Tab::History,
@@ -71,6 +74,7 @@ impl Tab {
             Tab::Settings => "Settings",
             Tab::Tools => "Tools",
             Tab::Media => "Media",
+            Tab::Files => "Files",
             Tab::Remote => "Remote",
             Tab::Screenshot => "Screenshot",
             Tab::History => "History",
@@ -97,6 +101,7 @@ impl Tab {
             Tab::Settings => Icon::SlidersHorizontal,
             Tab::Tools => Icon::Wrench,
             Tab::Media => Icon::SquarePlay,
+            Tab::Files => Icon::FolderOpen,
             Tab::Remote => Icon::Tv,
             Tab::Screenshot => Icon::Camera,
             Tab::History => Icon::FileClock,

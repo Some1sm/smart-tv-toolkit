@@ -45,11 +45,6 @@ pub fn well(_: &Theme) -> container::Style {
     container::Style { background: bg(WELL), border: border(alpha(BORDER, 0.6), RADIUS), ..Default::default() }
 }
 
-/// An inset list area (file listings and the like).
-pub fn inset(_: &Theme) -> container::Style {
-    container::Style { background: bg(INSET), border: border(BORDER, RADIUS), ..Default::default() }
-}
-
 /// Flyout / context menu (Level 3): acrylic tone, contour stroke, drop shadow.
 pub fn flyout(_: &Theme) -> container::Style {
     container::Style {

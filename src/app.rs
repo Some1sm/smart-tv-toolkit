@@ -65,6 +65,7 @@ struct Tabs {
     settings: tabs::settings::State,
     tools: tabs::tools::State,
     media: tabs::media::State,
+    files: tabs::files::State,
     remote: tabs::remote::State,
     screenshot: tabs::screenshot::State,
     history: tabs::history::State,
@@ -119,6 +120,7 @@ pub enum Message {
     Settings(tabs::settings::Msg),
     Tools(tabs::tools::Msg),
     Media(tabs::media::Msg),
+    Files(tabs::files::Msg),
     Remote(tabs::remote::Msg),
     Screenshot(tabs::screenshot::Msg),
     History(tabs::history::Msg),
@@ -160,6 +162,17 @@ pub enum Zoom {
     In,
     Out,
     Reset,
+}
+
+/// Files dragged from the computer onto the window (for the Files tab).
+fn file_drop(event: iced::Event, _: iced::event::Status, _: iced::window::Id) -> Option<tabs::files::Msg> {
+    use iced::window::Event as W;
+    match event {
+        iced::Event::Window(W::FileDropped(path)) => Some(tabs::files::Msg::Dropped(path)),
+        iced::Event::Window(W::FileHovered(_)) => Some(tabs::files::Msg::Hovering(true)),
+        iced::Event::Window(W::FilesHoveredLeft) => Some(tabs::files::Msg::Hovering(false)),
+        _ => None,
+    }
 }
 
 /// Ctrl + = / Ctrl + − / Ctrl + 0, as in browsers.
@@ -249,6 +262,7 @@ impl App {
                 settings: Default::default(),
                 tools: Default::default(),
                 media,
+                files: Default::default(),
                 remote: Default::default(),
                 screenshot: Default::default(),
                 history: Default::default(),
@@ -334,6 +348,10 @@ impl App {
             if self.tab == Tab::Packages {
                 subs.push(iced::keyboard::listen().filter_map(tabs::packages::key_for).map(Message::Packages));
             }
+            // Files dragged onto the window are uploaded into the open folder.
+            if self.tab == Tab::Files && self.tabs.files.accepts_drops() {
+                subs.push(iced::event::listen_with(file_drop).map(Message::Files));
+            }
             if self.tab == Tab::Tools && self.tabs.tools.log_live() && !self.minimized {
                 subs.push(iced::time::every(Duration::from_secs(3)).map(|_| Message::Tools(tabs::tools::Msg::LogTick)));
             }
@@ -401,6 +419,7 @@ impl App {
         t.settings.reset();
         t.tools.reset();
         t.media.reset();
+        t.files.reset();
         t.screenshot.reset();
         t.history.reset();
         t.apps.reset();
@@ -415,7 +434,7 @@ impl App {
             Tab::Packages => self.tabs.packages.on_open(&mut ctx!(self)).map(Message::Packages),
             Tab::Performance => self.tabs.performance.on_open(&mut ctx!(self)).map(Message::Performance),
             Tab::Settings => self.tabs.settings.on_open(&mut ctx!(self)).map(Message::Settings),
-            Tab::Media => self.tabs.media.on_open(&mut ctx!(self)).map(Message::Media),
+            Tab::Files => self.tabs.files.on_open(&mut ctx!(self)).map(Message::Files),
             Tab::Apps => self.tabs.apps.on_open(&mut ctx!(self)).map(Message::Apps),
             Tab::Optimize => self.tabs.optimize.on_open(&mut ctx!(self)).map(Message::Optimize),
             Tab::Install => self.tabs.install.on_open(&mut ctx!(self)).map(Message::Install),
@@ -478,6 +497,7 @@ impl App {
             Message::Settings(m) => self.tabs.settings.update(m, &mut ctx!(self)).map(Message::Settings),
             Message::Tools(m) => self.tabs.tools.update(m, &mut ctx!(self)).map(Message::Tools),
             Message::Media(m) => self.tabs.media.update(m, &mut ctx!(self)).map(Message::Media),
+            Message::Files(m) => self.tabs.files.update(m, &mut ctx!(self)).map(Message::Files),
             Message::Remote(m) => self.tabs.remote.update(m, &mut ctx!(self)).map(Message::Remote),
             Message::Screenshot(m) => self.tabs.screenshot.update(m, &mut ctx!(self)).map(Message::Screenshot),
             Message::History(m) => self.tabs.history.update(m, &mut ctx!(self)).map(Message::History),
@@ -927,6 +947,7 @@ impl App {
             Tab::Settings => t.settings.view(&v).map(Message::Settings),
             Tab::Tools => t.tools.view(&v).map(Message::Tools),
             Tab::Media => t.media.view(&v).map(Message::Media),
+            Tab::Files => t.files.view(&v).map(Message::Files),
             Tab::Remote => t.remote.view(&v).map(Message::Remote),
             Tab::Screenshot => t.screenshot.view(&v).map(Message::Screenshot),
             Tab::History => t.history.view(&v).map(Message::History),
